@@ -684,6 +684,7 @@ os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
 
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
@@ -716,26 +717,11 @@ def static_html_response(filename: str):
     path = os.path.join(STATIC_DIR, filename)
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
-    return Response(versioned_static_html(html), media_type="text/html; charset=utf-8")
-
-@app.get("/static/{path:path}")
-def static_file(path: str):
-    safe_path = str(path or "").replace("\\", "/").lstrip("/")
-    if not safe_path or any(part in {"", ".", ".."} for part in safe_path.split("/")):
-        raise HTTPException(status_code=404, detail="Not found")
-    local_path = os.path.abspath(os.path.join(STATIC_DIR, safe_path))
-    static_root = os.path.abspath(STATIC_DIR)
-    try:
-        if os.path.commonpath([static_root, local_path]) != static_root:
-            raise HTTPException(status_code=404, detail="Not found")
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Not found")
-    if not os.path.exists(local_path) or not os.path.isfile(local_path):
-        raise HTTPException(status_code=404, detail="Not found")
-    if local_path.lower().endswith(".html"):
-        with open(local_path, "r", encoding="utf-8") as f:
-            return Response(versioned_static_html(f.read()), media_type="text/html; charset=utf-8")
-    return FileResponse(local_path, media_type=content_type_for_path(local_path))
+    return Response(
+        versioned_static_html(html),
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 @app.get("/api/app-info")
 def app_info():
