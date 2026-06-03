@@ -22,6 +22,7 @@ import mimetypes
 import tempfile
 import math
 import shlex
+import functools
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock
 import httpx
@@ -1055,6 +1056,7 @@ def normalize_provider(item):
         "image_models": model_list_from_values(item.get("image_models") or []),
         "chat_models": model_list_from_values(item.get("chat_models") or []),
         "video_models": model_list_from_values(item.get("video_models") or []),
+        "model_protocols": normalize_model_protocols(item.get("model_protocols")),
         "ms_loras": normalize_ms_loras(item.get("ms_loras") or []),
         "ms_defaults_version": int(item.get("ms_defaults_version") or 0),
         "rh_apps": normalize_runninghub_entries(item.get("rh_apps") or [], "app"),
@@ -1949,6 +1951,7 @@ class ApiProviderPayload(BaseModel):
     image_models: List[str] = []
     chat_models: List[str] = []
     video_models: List[str] = []
+    model_protocols: Dict[str, str] = {}
     ms_loras: List[Dict[str, Any]] = []
     ms_defaults_version: int = 0
     rh_apps: List[Dict[str, Any]] = []
@@ -2004,6 +2007,13 @@ class CanvasCreateRequest(BaseModel):
     title: str = "未命名画布"
     icon: str = "🧩"
     kind: str = "classic"
+
+class CanvasMetaUpdate(BaseModel):
+    title: Optional[str] = None
+    icon: Optional[str] = None
+    owner: Optional[str] = None
+    color: Optional[str] = None
+    pinned: Optional[bool] = None
 
 class CanvasSaveRequest(BaseModel):
     title: str = "未命名画布"
@@ -2098,6 +2108,10 @@ class PromptLibraryItemRequest(BaseModel):
 
 class PromptLibraryBatchDeleteRequest(BaseModel):
     ids: List[str] = []
+
+class PromptLibraryCategoryRequest(BaseModel):
+    name: str = "新分组"
+    library_id: str = ""
 
 # --- 负载均衡 ---
 
@@ -2429,6 +2443,9 @@ def new_canvas(title="未命名画布", icon="layers", kind="classic"):
         "title": (title or ("智能画布" if canvas_kind == "smart" else "未命名画布"))[:80],
         "icon": (icon or ("sparkles" if canvas_kind == "smart" else "🧩"))[:32],
         "kind": canvas_kind,
+        "owner": "",
+        "color": "",
+        "pinned": False,
         "created_at": timestamp,
         "updated_at": timestamp,
         "nodes": [],
@@ -2455,12 +2472,21 @@ def load_canvas_any(canvas_id):
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+CANVAS_COLORS = {"", "red", "orange", "amber", "green", "teal", "blue", "violet", "pink", "slate"}
+
+def normalize_canvas_color(value):
+    color = str(value or "").strip().lower()
+    return color if color in CANVAS_COLORS else ""
+
 def canvas_record(data):
     return {
         "id": data.get("id"),
         "title": data.get("title", "未命名画布"),
         "icon": data.get("icon", "🧩"),
         "kind": normalize_canvas_kind(data.get("kind")),
+        "owner": str(data.get("owner") or "")[:40],
+        "color": normalize_canvas_color(data.get("color")),
+        "pinned": bool(data.get("pinned") or False),
         "created_at": data.get("created_at", 0),
         "updated_at": data.get("updated_at", 0),
         "deleted_at": data.get("deleted_at", 0),
@@ -2502,7 +2528,13 @@ def iter_canvas_records(include_deleted=False):
 
 def list_canvases():
     records = iter_canvas_records(include_deleted=False)
-    return sorted(records, key=lambda item: item["updated_at"], reverse=True)
+    return sorted(
+        records,
+        key=lambda item: (
+            0 if item.get("pinned") else 1,
+            -int(item.get("updated_at") or item.get("created_at") or 0),
+        ),
+    )
 
 def list_deleted_canvases():
     records = iter_canvas_records(include_deleted=True)
@@ -2525,19 +2557,19 @@ def resolve_chat_provider(provider: str, model: str, ms_model: str):
     base_root = (api_provider.get("base_url") or AI_BASE_URL).rstrip("/")
     if not base_root:
         raise HTTPException(status_code=400, detail=f"{api_provider.get('name') or api_provider['id']} 未配置 Base URL")
-    protocol = provider_protocol(api_provider)
+    default_model = preferred_chat_model(api_provider)
+    mdl = selected_model(model, default_model)
+    protocol = effective_protocol(api_provider, mdl)
     if protocol == "gemini":
         base = base_root if base_root.endswith("/v1beta") else base_root + "/v1beta"
     elif protocol == "volcengine":
         base = base_root if base_root.endswith("/api/v3") else base_root + "/api/v3"
     else:
         base = base_root if base_root.endswith("/v1") else base_root + "/v1"
-    hdrs = api_headers(provider=api_provider)
-    default_model = preferred_chat_model(api_provider)
-    mdl = selected_model(model, default_model)
+    hdrs = api_headers(provider=api_provider, model=mdl)
     return base, hdrs, mdl
 
-def api_headers(json_body=True, provider=None):
+def api_headers(json_body=True, provider=None, model=""):
     if provider:
         key_env = provider_key_env(provider["id"])
         api_key = os.getenv(key_env, "")
@@ -2548,7 +2580,7 @@ def api_headers(json_body=True, provider=None):
         api_key = AI_API_KEY
         if not api_key:
             raise HTTPException(status_code=400, detail="未配置 COMFLY_API_KEY，请在 API/.env 中填写。")
-    if provider and provider_protocol(provider) == "gemini":
+    if provider and effective_protocol(provider, model) == "gemini":
         headers = {"Accept": "application/json", "x-goog-api-key": api_key}
     else:
         headers = {"Accept": "application/json", "Authorization": bearer_auth_value(api_key)}
@@ -2702,6 +2734,35 @@ def images_api_unsupported(response):
 
 def provider_protocol(provider):
     return str((provider or {}).get("protocol") or "openai").strip().lower()
+
+# 单模型可覆盖的协议（仅 OpenAI / Gemini，二者可共用同一站点的 Base URL + Key）
+PER_MODEL_PROTOCOL_OPTIONS = {"openai", "gemini"}
+# 协议固定、不支持单模型覆盖的内置平台
+FIXED_PROTOCOL_PROVIDER_IDS = {"modelscope", "volcengine", "jimeng", "runninghub"}
+
+def normalize_model_protocols(value):
+    """规整 {模型名: 协议} 覆盖表，仅保留 openai/gemini。"""
+    out = {}
+    if isinstance(value, dict):
+        for raw_name, raw_proto in value.items():
+            name = str(raw_name or "").strip()
+            proto = str(raw_proto or "").strip().lower()
+            if name and proto in PER_MODEL_PROTOCOL_OPTIONS:
+                out[name] = proto
+    return out
+
+def effective_protocol(provider, model=""):
+    """返回某模型实际生效的协议：优先单模型覆盖，否则用平台全局协议。"""
+    base = provider_protocol(provider)
+    pid = str((provider or {}).get("id") or "").strip().lower()
+    if pid in FIXED_PROTOCOL_PROVIDER_IDS:
+        return base
+    overrides = (provider or {}).get("model_protocols")
+    if isinstance(overrides, dict):
+        val = str(overrides.get(str(model or "").strip()) or "").strip().lower()
+        if val in PER_MODEL_PROTOCOL_OPTIONS:
+            return val
+    return base
 
 def is_apimart_provider(provider):
     base_url = str((provider or {}).get("base_url") or "").lower()
@@ -3902,10 +3963,10 @@ def defaultPromptTemplateCategories():
         {"id": "character", "name": "角色"},
         {"id": "product", "name": "产品"},
         {"id": "lighting", "name": "光影"},
-        {"id": "custom", "name": "自定义"},
+        {"id": "custom", "name": "我的"},
     ]
 
-def normalize_prompt_template_categories(*category_lists):
+def normalize_prompt_template_categories(*category_lists, include_defaults=True):
     normalized = []
     seen = set()
 
@@ -3916,11 +3977,12 @@ def normalize_prompt_template_categories(*category_lists):
         if cat_id in seen:
             return
         seen.add(cat_id)
-        name = "自定义" if cat_id == "custom" else sanitize_asset_name(category.get("name") or cat_id, cat_id)
+        name = "我的" if cat_id == "custom" else sanitize_asset_name(category.get("name") or cat_id, cat_id)
         normalized.append({"id": cat_id, "name": name})
 
-    for category in defaultPromptTemplateCategories():
-        add_category(category)
+    if include_defaults:
+        for category in defaultPromptTemplateCategories():
+            add_category(category)
     for categories in category_lists:
         if isinstance(categories, list):
             for category in categories:
@@ -3930,19 +3992,24 @@ def normalize_prompt_template_categories(*category_lists):
 def normalize_prompt_libraries(data):
     if not isinstance(data, dict):
         data = default_prompt_libraries()
-    libraries = data.get("libraries") if isinstance(data.get("libraries"), list) else []
-    if not libraries:
-        libraries = default_prompt_libraries()["libraries"]
-    system_source = next((item for item in libraries if isinstance(item, dict) and item.get("id") == "system"), None)
-    source = system_source if isinstance(system_source, dict) else seed_system_prompt_library()
-    category_lists = [source.get("categories") if isinstance(source.get("categories"), list) else []]
-    items = []
-    seen_items = set()
-
-    def append_items(raw_items):
-        if not isinstance(raw_items, list):
-            return
-        for raw_item in raw_items:
+    raw_libraries = data.get("libraries") if isinstance(data.get("libraries"), list) else []
+    raw_libraries = [lib for lib in raw_libraries if isinstance(lib, dict)]
+    if not any(lib.get("id") == "system" for lib in raw_libraries):
+        raw_libraries = [seed_system_prompt_library()] + raw_libraries
+    libraries = []
+    seen_lib_ids = set()
+    for raw in raw_libraries:
+        is_system = raw.get("id") == "system"
+        if is_system:
+            lib_id = "system"
+        else:
+            lib_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(raw.get("id") or f"lib_{uuid.uuid4().hex[:12]}"))[:60] or f"lib_{uuid.uuid4().hex[:12]}"
+        if lib_id in seen_lib_ids:
+            continue
+        seen_lib_ids.add(lib_id)
+        items = []
+        seen_items = set()
+        for raw_item in (raw.get("items") if isinstance(raw.get("items"), list) else []):
             if not isinstance(raw_item, dict):
                 continue
             item = normalize_prompt_library_item(raw_item)
@@ -3951,23 +4018,25 @@ def normalize_prompt_libraries(data):
                 continue
             seen_items.add(item_id)
             items.append(item)
-
-    append_items(source.get("items") if isinstance(source, dict) else [])
-    for library in libraries:
-        if not isinstance(library, dict):
-            continue
-        category_lists.append(library.get("categories") if isinstance(library.get("categories"), list) else [])
-        if library.get("id") != "system":
-            append_items(library.get("items") if isinstance(library.get("items"), list) else [])
-    system_library = {
-        "id": "system",
-        "name": sanitize_asset_name(source.get("name") or "系统提示词库", "系统提示词库"),
-        "type": "prompt",
-        "readonly": False,
-        "categories": normalize_prompt_template_categories(*category_lists),
-        "items": items,
-    }
-    return {"active_library_id": "system", "libraries": [system_library], "updated_at": int(data.get("updated_at") or now_ms())}
+        default_name = "系统提示词库" if is_system else "提示词库"
+        raw_categories = raw.get("categories") if isinstance(raw.get("categories"), list) else []
+        if not is_system:
+            # 非系统库不保留任何内置分组（视角/分镜等），仅保留用户自建分组
+            builtin_ids = {"view", "storyboard", "character", "product", "lighting", "custom"}
+            raw_categories = [c for c in raw_categories if isinstance(c, dict) and normalize_prompt_category_id(c.get("id") or c.get("name") or "") not in builtin_ids]
+        libraries.append({
+            "id": lib_id,
+            "name": sanitize_asset_name(raw.get("name") or default_name, default_name),
+            "type": "prompt",
+            "readonly": False,
+            "system": is_system,
+            "categories": normalize_prompt_template_categories(raw_categories, include_defaults=is_system),
+            "items": items,
+        })
+    active = str(data.get("active_library_id") or "system")
+    if not any(lib["id"] == active for lib in libraries):
+        active = "system" if any(lib["id"] == "system" for lib in libraries) else (libraries[0]["id"] if libraries else "system")
+    return {"active_library_id": active, "libraries": libraries, "updated_at": int(data.get("updated_at") or now_ms())}
 
 def load_prompt_libraries():
     if not os.path.exists(PROMPT_LIBRARY_PATH):
@@ -5277,6 +5346,8 @@ def friendly_image_error_detail(text, size="", model=""):
         return f"该模型不支持当前尺寸：{size or '未指定'}。请尝试更换分辨率或模型。"
     if "inputtextsensitivecontentdetected" in lower_text or "policyviolation" in lower_text or "copyright restrictions" in lower_text:
         return "上游内容安全拦截了这段提示词，原因偏向版权/敏感内容限制。请改写提示词，避免直接出现具体 IP、角色名、品牌名、影视/动漫作品名，改成风格特征描述再试。"
+    if "rejected by the safety system" in lower_text or "image_generation_user_error" in lower_text or "safety system" in lower_text or "content_policy_violation" in lower_text or "content policy" in lower_text:
+        return "上游（Azure/OpenAI 系）内容安全系统拒绝了本次生图请求。可能是提示词或参考图触发了内容审核。请改写提示词、避免敏感/暴力/成人/名人/版权角色等描述；若使用了人物参考图，可换一张图再试。这是上游平台的审核策略，并非本系统报错。"
     if "rate limit" in lower_text or "429" in lower_text:
         return "请求过于频繁，已被上游限流，请稍后再试。"
     if "unauthorized" in lower_text or "401" in lower_text:
@@ -5769,7 +5840,285 @@ async def wait_for_runninghub_image_task(client, provider, task_id):
             pass
     raise HTTPException(status_code=504, detail=f"RunningHub 生图任务超时：{last_payload}")
 
+RUNNINGHUB_ENTRY_MODEL_RE = re.compile(r"^(app|workflow):(.+)$")
+
+def rh_field_kind(field):
+    field = field or {}
+    t = str(field.get("fieldType") or "").strip().upper()
+    if t == "IMAGE":
+        return "image"
+    if t == "VIDEO":
+        return "video"
+    if t == "AUDIO":
+        return "audio"
+    if t == "SLIDER":
+        return "slider"
+    if t in ("NUMBER", "FLOAT", "INTEGER", "INT"):
+        return "number"
+    if t in ("BOOLEAN", "BOOL"):
+        return "boolean"
+    key = f"{field.get('fieldName') or ''} {field.get('fieldValue') or ''}".lower()
+    if re.search(r"\b(image|img|mask|photo|picture)\b", key) or re.search(r"\.(png|jpe?g|webp|gif|bmp)(\?|$)", key, re.I):
+        return "image"
+    if re.search(r"\b(video|movie|mp4)\b", key) or re.search(r"\.(mp4|webm|mov|m4v|mkv)(\?|$)", key, re.I):
+        return "video"
+    if re.search(r"\b(audio|sound|music|voice)\b", key) or re.search(r"\.(mp3|wav|ogg|m4a|flac|aac)(\?|$)", key, re.I):
+        return "audio"
+    return "text"
+
+def rh_field_role(field):
+    kind = rh_field_kind(field)
+    if kind in ("image", "video", "audio", "number", "slider", "boolean"):
+        return kind
+    field = field or {}
+    text = f"{field.get('fieldName') or ''} {field.get('label') or ''} {field.get('group') or ''}".lower()
+    if re.search(r"prompt|positive|negative|text|caption|description|关键词|提示词|正向|负向", text):
+        return "prompt"
+    return "text"
+
+def _rh_natural_cmp(x, y):
+    if x == y:
+        return 0
+    if x.isdigit() and y.isdigit():
+        ix, iy = int(x), int(y)
+        return (ix > iy) - (ix < iy)
+    return (x > y) - (x < y)
+
+def _rh_field_cmp(a, b):
+    ak, bk = rh_field_kind(a), rh_field_kind(b)
+    if ak == "image" and bk == "image":
+        try:
+            ao = int(a.get("imageOrder") or 0) or 9999
+        except Exception:
+            ao = 9999
+        try:
+            bo = int(b.get("imageOrder") or 0) or 9999
+        except Exception:
+            bo = 9999
+        if ao != bo:
+            return ao - bo
+    if ak == "image" and bk != "image":
+        return -1
+    if ak != "image" and bk == "image":
+        return 1
+    node_cmp = _rh_natural_cmp(str(a.get("nodeId") or ""), str(b.get("nodeId") or ""))
+    if node_cmp != 0:
+        return node_cmp
+    fa, fb = str(a.get("fieldName") or ""), str(b.get("fieldName") or "")
+    return (fa > fb) - (fa < fb)
+
+def rh_sort_fields(fields):
+    return sorted(list(fields or []), key=functools.cmp_to_key(_rh_field_cmp))
+
+def rh_field_indexes(fields):
+    counters = {"image": 0, "video": 0, "audio": 0}
+    mapping = {}
+    for field in rh_sort_fields(fields):
+        kind = rh_field_kind(field)
+        if kind in counters:
+            mapping[(str(field.get("nodeId") or ""), str(field.get("fieldName") or ""))] = counters[kind]
+            counters[kind] += 1
+    return mapping
+
+def rh_default_value(field):
+    value = (field or {}).get("fieldValue")
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if value is None or isinstance(value, dict):
+        return ""
+    return str(value)
+
+def rh_random_field_value(field):
+    def _num(raw, default):
+        try:
+            s = str(raw).strip()
+            if s == "" or s.lower() == "none":
+                return default
+            return float(s)
+        except Exception:
+            return default
+    lo = _num((field or {}).get("min"), 0.0)
+    hi = _num((field or {}).get("max"), 4294967295.0)
+    if hi < lo:
+        lo, hi = hi, lo
+    step = _num((field or {}).get("step"), 1.0)
+    value = random.uniform(lo, hi)
+    if step and step > 0:
+        value = lo + round((value - lo) / step) * step
+    if float(step).is_integer() and float(lo).is_integer() and float(hi).is_integer():
+        return str(int(round(value)))
+    return str(value)
+
+def runninghub_entry_config_from_model(provider, model):
+    """解析 model=app:ID / workflow:ID，返回 {kind,id,fields,optionalImageMode,workflowJson} 或 None。"""
+    text = str(model or "").strip()
+    match = RUNNINGHUB_ENTRY_MODEL_RE.match(text)
+    if not match:
+        return None
+    kind = match.group(1)
+    entry_id = match.group(2).strip()
+    if not entry_id:
+        return None
+    if kind == "workflow":
+        key = runninghub_workflow_store_key(entry_id)
+        with RUNNINGHUB_WORKFLOW_LOCK:
+            store = load_runninghub_workflow_store()
+        cfg = runninghub_select_workflow_config(store.get(key), runninghub_provider_workflow_config(key))
+        if not isinstance(cfg, dict):
+            # 退回到 provider 列表中的内联条目
+            entry = next(
+                (e for e in (provider.get("rh_workflows") or []) if runninghub_entry_id(e, "workflow") == entry_id),
+                None,
+            )
+            if not entry:
+                return None
+            cfg = {
+                "fields": entry.get("fields") or [],
+                "optionalImageMode": entry.get("optionalImageMode") or "prune-workflow",
+                "workflowJson": entry.get("workflowJson") if isinstance(entry.get("workflowJson"), dict) else {},
+            }
+        return {
+            "kind": "workflow",
+            "id": entry_id,
+            "fields": cfg.get("fields") or [],
+            "optionalImageMode": cfg.get("optionalImageMode") or "prune-workflow",
+            "workflowJson": cfg.get("workflowJson") if isinstance(cfg.get("workflowJson"), dict) else {},
+        }
+    entry = next(
+        (e for e in (provider.get("rh_apps") or []) if runninghub_entry_id(e, "app") == entry_id),
+        None,
+    )
+    if not entry:
+        return None
+    return {
+        "kind": "app",
+        "id": entry_id,
+        "fields": entry.get("fields") or [],
+        "optionalImageMode": "",
+        "workflowJson": {},
+    }
+
+async def runninghub_upload_local_to_filename(client, provider, url, use_wallet=False):
+    """把本地/远程素材上传到 RunningHub /task/openapi/upload，返回 fileName（供 nodeInfoList 使用）。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    path = runninghub_local_asset_path(text)
+    if path:
+        filename = os.path.basename(path)
+        content_type = content_type_for_path(path)
+        with open(path, "rb") as fh:
+            content = fh.read()
+    elif text.startswith(("http://", "https://")):
+        response = await client.get(text, follow_redirects=True)
+        response.raise_for_status()
+        content = response.content
+        content_type = response.headers.get("content-type") or "application/octet-stream"
+        filename = os.path.basename(urllib.parse.urlsplit(text).path) or "asset.bin"
+    else:
+        return ""
+    if not content:
+        return ""
+    api_key = runninghub_api_key(provider, use_wallet=use_wallet)
+    upload_url = runninghub_endpoint_url(provider, "/task/openapi/upload")
+    files = {"file": (filename, content, content_type)}
+    data = {"apiKey": api_key, "fileType": "input"}
+    response = await client.post(upload_url, headers=runninghub_app_headers(False, use_wallet), data=data, files=files)
+    raw = response.json()
+    if isinstance(raw, dict) and raw.get("code") in (0, "0") and isinstance(raw.get("data"), dict) and raw["data"].get("fileName"):
+        return raw["data"]["fileName"]
+    raise HTTPException(status_code=502, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传素材失败：{raw}")
+
+async def generate_runninghub_entry_image(prompt, model, reference_images, provider, entry):
+    """运行 RunningHub 工作流 / AI 应用（与智能画布一致的运行方式），返回首张图片结果。"""
+    kind = entry["kind"]
+    entry_id = entry["id"]
+    fields = rh_sort_fields([f for f in (entry.get("fields") or []) if isinstance(f, dict) and f.get("enabled") is True])
+    idx_map = rh_field_indexes(fields)
+    use_wallet = False
+    timeout = httpx.Timeout(connect=20.0, read=1800.0, write=240.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        uploaded = []
+        for ref in (reference_images or [])[:10]:
+            ref_url = ref.get("url") if isinstance(ref, dict) else ref
+            if not ref_url:
+                continue
+            file_name = await runninghub_upload_local_to_filename(client, provider, ref_url, use_wallet)
+            if file_name:
+                uploaded.append(file_name)
+
+        node_info_list = []
+        prompt_text = str(prompt or "").strip()
+        for field in fields:
+            node_id = str(field.get("nodeId") or "").strip()
+            field_name = str(field.get("fieldName") or "").strip()
+            if not node_id or not field_name:
+                continue
+            kind_f = rh_field_kind(field)
+            if kind_f in ("image", "video", "audio"):
+                if kind_f != "image":
+                    continue  # 在线生图仅提供图片素材
+                index = idx_map.get((node_id, field_name), 0)
+                value = uploaded[index] if index < len(uploaded) else ""
+                if not value:
+                    # 工作流可选图（required!=True）无输入则跳过；必填图回退默认值
+                    if field.get("required") is True:
+                        value = rh_default_value(field)
+                        if not value:
+                            continue
+                    else:
+                        continue
+                node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": value})
+            elif rh_field_role(field) == "prompt":
+                value = prompt_text or rh_default_value(field)
+                node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": value})
+            elif kind_f == "number" and field.get("random_enabled") is True:
+                node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": rh_random_field_value(field)})
+            else:
+                node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": rh_default_value(field)})
+
+        api_key = runninghub_api_key(provider, use_wallet=use_wallet)
+        if kind == "workflow":
+            submit_url = runninghub_endpoint_url(provider, "/task/openapi/create")
+            body = {"apiKey": api_key, "workflowId": entry_id, "addMetadata": True}
+            if node_info_list:
+                body["nodeInfoList"] = node_info_list
+        else:
+            submit_url = runninghub_endpoint_url(provider, "/task/openapi/ai-app/run")
+            body = {"apiKey": api_key, "webappId": entry_id, "nodeInfoList": node_info_list}
+
+        response = await client.post(submit_url, headers=runninghub_app_headers(True, use_wallet), json=body)
+        raw = response.json()
+        if not (isinstance(raw, dict) and raw.get("code") in (0, "0")):
+            raise HTTPException(status_code=502, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 提交失败：{raw}")
+        task_id = raw.get("data", {}).get("taskId") if isinstance(raw.get("data"), dict) else ""
+        if not task_id:
+            raise HTTPException(status_code=502, detail=f"RunningHub 未返回 taskId：{raw}")
+
+        query_url = runninghub_endpoint_url(provider, "/task/openapi/outputs")
+        deadline = time.monotonic() + 1800
+        last_payload = None
+        while time.monotonic() < deadline:
+            await asyncio.sleep(2.5)
+            query_response = await client.post(query_url, headers=runninghub_app_headers(True), json={"apiKey": api_key, "taskId": task_id})
+            query_raw = query_response.json()
+            last_payload = query_raw
+            code = query_raw.get("code") if isinstance(query_raw, dict) else None
+            if code in (0, "0"):
+                outputs = runninghub_extract_outputs(query_raw.get("data"))
+                for remote in outputs:
+                    if str(remote or "").startswith(("http://", "https://", "/output/", "/assets/")):
+                        return {"type": "url", "value": str(remote)}, query_raw
+                raise HTTPException(status_code=502, detail=f"RunningHub 任务无图片输出：{query_raw}")
+            if code in (805, "805"):
+                raise HTTPException(status_code=502, detail=f"RunningHub 任务失败：{runninghub_fail_reason(query_raw) or query_raw}")
+            # 804 运行中 / 813 排队中 / 其他状态继续轮询
+        raise HTTPException(status_code=504, detail=f"RunningHub 任务超时：{last_payload}")
+
 async def generate_runninghub_provider_image(prompt, size, model, reference_images=None, provider=None):
+    entry = runninghub_entry_config_from_model(provider, model)
+    if entry:
+        return await generate_runninghub_entry_image(prompt, model, reference_images, provider, entry)
     endpoint = runninghub_task_endpoint(provider, model)
     width, height = parse_size_pair(size)
     body = {"prompt": prompt}
@@ -5803,7 +6152,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
         return await generate_runninghub_provider_image(prompt, size, model, reference_images, provider)
-    if is_gemini_provider(provider):
+    if effective_protocol(provider, model) == "gemini":
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
         return await generate_volcengine_provider_image(prompt, size, model, reference_images, provider)
@@ -5829,7 +6178,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 data["quality"] = quality
             return await client.post(
                 edit_url,
-                headers=api_headers(json_body=False, provider=provider),
+                headers=api_headers(json_body=False, provider=provider, model=model),
                 data=data,
                 files=edit_files if edit_files is not None else {},
             )
@@ -5848,12 +6197,12 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             }
             if image_refs:
                 body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:16]]
-            response = await client.post(gen_url, headers=api_headers(provider=provider), json=body)
+            response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
         elif is_gpt2 and not image_refs and not mask_refs:
             body = {"model": model, "prompt": prompt, "size": size}
             if quality:
                 body["quality"] = quality
-            response = await client.post(gen_url, headers=api_headers(provider=provider), json=body)
+            response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
             if response.status_code >= 400 and images_api_unsupported(response):
                 response = await post_openai_edits()
         elif image_refs:
@@ -5906,7 +6255,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 }
                 if quality:
                     body["quality"] = quality
-                response = await client.post(gen_url, headers=api_headers(provider=provider), json=body)
+                response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
                 if response.status_code >= 400 and images_api_unsupported(response):
                     raise HTTPException(
                         status_code=502,
@@ -5918,7 +6267,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 body["quality"] = quality
             response = await client.post(
                 gen_url,
-                headers=api_headers(provider=provider),
+                headers=api_headers(provider=provider, model=model),
                 json=body,
             )
             if response.status_code >= 400 and images_api_unsupported(response):
@@ -6699,6 +7048,7 @@ def volcengine_default_model_payload(status=200, message="", raw=None):
     models = VOLCENGINE_DEFAULT_VIDEO_MODELS[:]
     return {
         "ok": True,
+        "protocol": "volcengine",
         "status": status,
         "message": message or "方舟任务接口可用，模型列表接口未返回模型，已使用默认 Seedance 模型。",
         "model_count": len(models),
@@ -6795,6 +7145,27 @@ async def probe_openai_models_endpoint(client, base_url: str, api_key: str):
         return False, {"status": response.status_code, "message": f"OpenAI /v1/models 不可用 (HTTP {response.status_code})", "raw": raw}
     return False, {"status": response.status_code, "message": f"OpenAI /v1/models 服务端错误 {response.status_code}", "raw": raw}
 
+async def probe_volcengine_auto_detect(client, base_url: str, api_key: str):
+    task_ok, task_probe = await probe_volcengine_task_endpoint(client, base_url, api_key)
+    if task_ok:
+        return True, {
+            "status": task_probe.get("status") or 200,
+            "message": "检测到方舟/Ark 任务协议",
+            "raw": {"task_probe": task_probe.get("raw")},
+        }
+    compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
+    if compat_ok:
+        return True, {
+            "status": compat_probe.get("status") or 200,
+            "message": "检测到方舟/Ark Bearer 鉴权入口（OpenAI 兼容透传）",
+            "raw": {"task_probe": task_probe, "openai_compat_probe": compat_probe.get("raw")},
+        }
+    return False, {
+        "status": compat_probe.get("status") or task_probe.get("status") or 0,
+        "message": compat_probe.get("message") or task_probe.get("message") or "未检测到方舟/Ark 兼容入口",
+        "raw": {"task_probe": task_probe, "openai_compat_probe": compat_probe.get("raw")},
+    }
+
 def classify_upstream_model(mid):
     lc = str(mid or "").lower()
     video_keys = ["veo", "sora", "wan2", "wanx", "doubao-seedance", "doubao-1", "kling", "hailuo", "video", "t2v-", "i2v-", "s2v"]
@@ -6870,38 +7241,31 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 return {"ok": False, "status": resp.status_code, "message": f"上游 {endpoint_label} 返回网页 HTML，请检查请求地址是否为 API Base URL"}
             if resp.status_code >= 400:
                 if protocol == "volcengine":
-                    task_ok, task_probe = await probe_volcengine_task_endpoint(client, base_url, api_key)
-                    if task_ok:
-                        message = f"{task_probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。"
-                        return volcengine_default_model_payload(status=task_probe.get("status") or resp.status_code, message=message, raw={"models_error": resp.text[:300], "task_probe": task_probe.get("raw")})
-                    compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
-                    if compat_ok:
-                        message = f"{compat_probe.get('message') or 'OpenAI 兼容 Bearer 鉴权入口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。"
-                        return volcengine_default_model_payload(status=compat_probe.get("status") or resp.status_code, message=message, raw={"models_error": resp.text[:300], "task_probe": task_probe, "openai_compat_probe": compat_probe.get("raw")})
+                    detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                    if detected:
+                        message = f"{probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。"
+                        return volcengine_default_model_payload(status=probe.get("status") or resp.status_code, message=message, raw={"models_error": resp.text[:300], **(probe.get("raw") or {})})
+                elif protocol == "openai":
+                    detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                    if detected:
+                        message = f"{probe.get('message') or '检测到方舟/Ark 兼容入口'}；OpenAI /v1/models 不可用，已自动切换为方舟协议并使用默认 Seedance 模型。"
+                        return volcengine_default_model_payload(status=probe.get("status") or resp.status_code, message=message, raw={"models_error": resp.text[:300], **(probe.get("raw") or {})})
                 return {"ok": False, "status": resp.status_code, "message": resp.text[:300]}
             data = resp.json() if resp.text else {}
             grouped, ids = parse_upstream_models(data, protocol)
             if protocol == "volcengine" and not ids:
-                ok, probe = await probe_volcengine_task_endpoint(client, base_url, api_key)
-                if ok:
+                detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                if detected:
                     return volcengine_default_model_payload(status=resp.status_code, raw=data)
-                compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
-                if compat_ok:
-                    message = f"{compat_probe.get('message') or 'OpenAI 兼容 Bearer 鉴权入口可达'}；模型列表未返回模型，已使用默认 Seedance 模型。"
-                    return volcengine_default_model_payload(status=compat_probe.get("status") or resp.status_code, message=message, raw={"models_raw": data, "task_probe": probe, "openai_compat_probe": compat_probe.get("raw")})
             return {"ok": True, "status": resp.status_code, "model_count": len(ids), "image_models": grouped["image"], "chat_models": grouped["chat"], "video_models": grouped["video"], "all": ids}
     except httpx.HTTPError as e:
         if protocol == "volcengine":
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
-                    task_ok, task_probe = await probe_volcengine_task_endpoint(client, base_url, api_key)
-                    if task_ok:
-                        message = f"{task_probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。"
-                        return volcengine_default_model_payload(status=task_probe.get("status") or 0, message=message, raw={"models_error": str(e)[:300], "task_probe": task_probe.get("raw")})
-                    compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
-                    if compat_ok:
-                        message = f"{compat_probe.get('message') or 'OpenAI 兼容 Bearer 鉴权入口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。"
-                        return volcengine_default_model_payload(status=compat_probe.get("status") or 0, message=message, raw={"models_error": str(e)[:300], "task_probe": task_probe, "openai_compat_probe": compat_probe.get("raw")})
+                    detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                    if detected:
+                        message = f"{probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。"
+                        return volcengine_default_model_payload(status=probe.get("status") or 0, message=message, raw={"models_error": str(e)[:300], **(probe.get("raw") or {})})
             except Exception:
                 pass
         return {"ok": False, "status": 0, "message": str(e)[:300]}
@@ -6990,6 +7354,16 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
                 return {"ok": False, "protocol": "apimart", "status_code": sc, "message": async_probe["message"], "raw": body}
 
             openai_ok, openai_probe = await probe_openai_models_endpoint(client, base_url, api_key)
+            if not openai_ok and protocol == "openai":
+                detected, volc_probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                if detected:
+                    return {
+                        "ok": True,
+                        "protocol": "volcengine",
+                        "status_code": volc_probe.get("status") or openai_probe.get("status") or sc,
+                        "message": f"{volc_probe.get('message') or '检测到方舟/Ark 兼容入口'}，已自动切换为方舟/Ark 任务协议",
+                        "raw": {"async_probe": async_probe, "openai_probe": openai_probe.get("raw"), **(volc_probe.get("raw") or {})},
+                    }
             return {
                 "ok": openai_ok,
                 "protocol": "openai",
@@ -7038,15 +7412,16 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                 raise HTTPException(status_code=400, detail=f"上游 {endpoint_label} 返回网页 HTML，请检查请求地址是否为 API Base URL")
             if resp.status_code >= 400:
                 if protocol == "volcengine":
-                    task_ok, task_probe = await probe_volcengine_task_endpoint(client, base_url, api_key)
-                    if task_ok:
+                    detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                    if detected:
                         payload = volcengine_default_model_payload(
-                            status=task_probe.get("status") or resp.status_code,
-                            message=f"{task_probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。",
-                            raw={"models_error": resp.text[:300], "task_probe": task_probe.get("raw")},
+                            status=probe.get("status") or resp.status_code,
+                            message=f"{probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。",
+                            raw={"models_error": resp.text[:300], **(probe.get("raw") or {})},
                         )
                         return {
                             "total": payload["model_count"],
+                            "protocol": payload["protocol"],
                             "image_models": payload["image_models"],
                             "chat_models": payload["chat_models"],
                             "video_models": payload["video_models"],
@@ -7054,15 +7429,17 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                             "message": payload["message"],
                             "raw": payload["raw"],
                         }
-                    compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
-                    if compat_ok:
+                elif protocol == "openai":
+                    detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                    if detected:
                         payload = volcengine_default_model_payload(
-                            status=compat_probe.get("status") or resp.status_code,
-                            message=f"{compat_probe.get('message') or 'OpenAI 兼容 Bearer 鉴权入口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。",
-                            raw={"models_error": resp.text[:300], "task_probe": task_probe, "openai_compat_probe": compat_probe.get("raw")},
+                            status=probe.get("status") or resp.status_code,
+                            message=f"{probe.get('message') or '检测到方舟/Ark 兼容入口'}；OpenAI /v1/models 不可用，已自动切换为方舟协议并使用默认 Seedance 模型。",
+                            raw={"models_error": resp.text[:300], **(probe.get("raw") or {})},
                         )
                         return {
                             "total": payload["model_count"],
+                            "protocol": payload["protocol"],
                             "image_models": payload["image_models"],
                             "chat_models": payload["chat_models"],
                             "video_models": payload["video_models"],
@@ -7076,31 +7453,16 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
         if protocol == "volcengine":
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
-                    task_ok, task_probe = await probe_volcengine_task_endpoint(client, base_url, api_key)
-                    if task_ok:
+                    detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
+                    if detected:
                         payload = volcengine_default_model_payload(
-                            status=task_probe.get("status") or 0,
-                            message=f"{task_probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。",
-                            raw={"models_error": str(e)[:300], "task_probe": task_probe.get("raw")},
+                            status=probe.get("status") or 0,
+                            message=f"{probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。",
+                            raw={"models_error": str(e)[:300], **(probe.get("raw") or {})},
                         )
                         return {
                             "total": payload["model_count"],
-                            "image_models": payload["image_models"],
-                            "chat_models": payload["chat_models"],
-                            "video_models": payload["video_models"],
-                            "all": payload["all"],
-                            "message": payload["message"],
-                            "raw": payload["raw"],
-                        }
-                    compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
-                    if compat_ok:
-                        payload = volcengine_default_model_payload(
-                            status=compat_probe.get("status") or 0,
-                            message=f"{compat_probe.get('message') or 'OpenAI 兼容 Bearer 鉴权入口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。",
-                            raw={"models_error": str(e)[:300], "task_probe": task_probe, "openai_compat_probe": compat_probe.get("raw")},
-                        )
-                        return {
-                            "total": payload["model_count"],
+                            "protocol": payload["protocol"],
                             "image_models": payload["image_models"],
                             "chat_models": payload["chat_models"],
                             "video_models": payload["video_models"],
@@ -7569,7 +7931,6 @@ async def canvas_video(payload: CanvasVideoRequest):
                 if is_volcengine:
                     text = str(payload.prompt or "").strip()
                     volc_model = selected_model(payload.model, "doubao-seedance-2-0-fast-260128")
-                    has_reference_media = any(ref.url for ref in payload.images) or any(str(url or "").strip() for url in (payload.videos or []))
                     body = {
                         "model": volc_model,
                         "content": [
@@ -7579,8 +7940,9 @@ async def canvas_video(payload: CanvasVideoRequest):
                             }
                         ],
                     }
-                    if not (has_reference_media and is_volcengine_seedance2_model(volc_model)):
-                        body["duration"] = volcengine_video_duration(payload.duration)
+                    # 火山方舟视频接口（含 Seedance 2.0 图生视频）均通过 body 的 duration 字段控制时长；
+                    # 之前对 seedance-2.0 + 参考图的情况省略了 duration，导致接口回退到默认 5s。
+                    body["duration"] = volcengine_video_duration(payload.duration)
                     if payload.aspect_ratio:
                         body["ratio"] = payload.aspect_ratio
                     resolution = volcengine_video_resolution(payload.resolution)
@@ -7899,6 +8261,26 @@ async def get_canvas_meta(canvas_id: str):
         "kind": normalize_canvas_kind(canvas.get("kind")),
     }
 
+@app.post("/api/canvases/{canvas_id}/meta")
+async def update_canvas_meta(canvas_id: str, payload: CanvasMetaUpdate):
+    """更新画布的轻量元数据（标题/图标/负责人/颜色/置顶）。
+    刻意不走 save_canvas（它会刷新 updated_at），以免打标签/置顶把画布顶到列表最前。"""
+    canvas = load_canvas(canvas_id)
+    if payload.title is not None:
+        canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
+    if payload.icon is not None:
+        canvas["icon"] = (payload.icon or "layers")[:32]
+    if payload.owner is not None:
+        canvas["owner"] = str(payload.owner).strip()[:40]
+    if payload.color is not None:
+        canvas["color"] = normalize_canvas_color(payload.color)
+    if payload.pinned is not None:
+        canvas["pinned"] = bool(payload.pinned)
+    with CANVAS_LOCK:
+        with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
+            json.dump(canvas, f, ensure_ascii=False, indent=2)
+    return {"canvas": canvas_record(canvas)}
+
 @app.get("/api/canvases/{canvas_id}")
 async def get_canvas(canvas_id: str):
     return {"canvas": load_canvas(canvas_id)}
@@ -8063,7 +8445,19 @@ async def get_prompt_libraries():
 
 @app.post("/api/prompt-libraries")
 async def create_prompt_library(payload: PromptLibraryRequest):
-    raise HTTPException(status_code=400, detail="提示词库已合并为系统提示词库，请直接在系统提示词库中新增提示词")
+    data = load_prompt_libraries()
+    library = {
+        "id": f"lib_{uuid.uuid4().hex[:12]}",
+        "name": sanitize_asset_name(payload.name, "提示词库"),
+        "type": "prompt",
+        "categories": [],
+        "items": [],
+    }
+    data.setdefault("libraries", []).append(library)
+    data["active_library_id"] = library["id"]
+    data = save_prompt_libraries(data)
+    new_lib = next((lib for lib in data.get("libraries", []) if lib.get("id") == library["id"]), library)
+    return {"library": public_prompt_libraries(data), "prompt_library": new_lib}
 
 @app.patch("/api/prompt-libraries/{library_id}")
 async def rename_prompt_library(library_id: str, payload: PromptLibraryRequest):
@@ -8077,7 +8471,18 @@ async def rename_prompt_library(library_id: str, payload: PromptLibraryRequest):
 
 @app.delete("/api/prompt-libraries/{library_id}")
 async def delete_prompt_library(library_id: str):
-    raise HTTPException(status_code=400, detail="系统提示词库不能删除，可以删除其中的提示词")
+    if library_id == "system":
+        raise HTTPException(status_code=400, detail="系统提示词库不能删除，可以删除其中的提示词")
+    data = load_prompt_libraries()
+    libraries = data.get("libraries", []) or []
+    kept = [lib for lib in libraries if lib.get("id") != library_id]
+    if len(kept) == len(libraries):
+        raise HTTPException(status_code=404, detail="提示词库不存在")
+    data["libraries"] = kept
+    if data.get("active_library_id") == library_id:
+        data["active_library_id"] = "system"
+    data = save_prompt_libraries(data)
+    return {"library": public_prompt_libraries(data)}
 
 @app.post("/api/prompt-libraries/items")
 async def add_prompt_library_item(payload: PromptLibraryItemRequest):
@@ -8158,6 +8563,63 @@ async def batch_delete_prompt_library_items(payload: PromptLibraryBatchDeleteReq
         library["items"] = keep
     data = save_prompt_libraries(data)
     return {"library": public_prompt_libraries(data), "removed": removed}
+
+PROMPT_BUILTIN_CATEGORY_IDS = {"view", "storyboard", "character", "product", "lighting", "custom"}
+
+@app.post("/api/prompt-libraries/categories")
+async def add_prompt_library_category(payload: PromptLibraryCategoryRequest):
+    data = load_prompt_libraries()
+    library = find_prompt_library(data, payload.library_id) or find_prompt_library(data, "system")
+    if not library:
+        raise HTTPException(status_code=404, detail="提示词库不存在")
+    name = sanitize_asset_name(payload.name, "新分组")
+    existing = {str(c.get("id")) for c in (library.get("categories") or []) if isinstance(c, dict)} | PROMPT_BUILTIN_CATEGORY_IDS
+    cat_id = f"pcat_{uuid.uuid4().hex[:10]}"
+    while cat_id in existing:
+        cat_id = f"pcat_{uuid.uuid4().hex[:10]}"
+    category = {"id": cat_id, "name": name}
+    library.setdefault("categories", []).append(category)
+    data = save_prompt_libraries(data)
+    return {"library": public_prompt_libraries(data), "category": category}
+
+@app.patch("/api/prompt-libraries/categories/{category_id}")
+async def rename_prompt_library_category(category_id: str, payload: PromptLibraryCategoryRequest):
+    if category_id in PROMPT_BUILTIN_CATEGORY_IDS:
+        raise HTTPException(status_code=400, detail="内置分组不能重命名")
+    name = sanitize_asset_name(payload.name, "")
+    if not name:
+        raise HTTPException(status_code=400, detail="分组名称不能为空")
+    data = load_prompt_libraries()
+    updated = False
+    for library in data.get("libraries", []) or []:
+        for cat in library.get("categories") or []:
+            if isinstance(cat, dict) and cat.get("id") == category_id:
+                cat["name"] = name
+                updated = True
+    if not updated:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    data = save_prompt_libraries(data)
+    return {"library": public_prompt_libraries(data)}
+
+@app.delete("/api/prompt-libraries/categories/{category_id}")
+async def delete_prompt_library_category(category_id: str):
+    if category_id in PROMPT_BUILTIN_CATEGORY_IDS:
+        raise HTTPException(status_code=400, detail="内置分组不能删除")
+    data = load_prompt_libraries()
+    found = False
+    for library in data.get("libraries", []) or []:
+        cats = library.get("categories") or []
+        kept = [c for c in cats if not (isinstance(c, dict) and c.get("id") == category_id)]
+        if len(kept) != len(cats):
+            found = True
+            library["categories"] = kept
+        for item in library.get("items", []) or []:
+            if isinstance(item, dict) and item.get("category") == category_id:
+                item["category"] = "custom"
+    if not found:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    data = save_prompt_libraries(data)
+    return {"library": public_prompt_libraries(data)}
 
 @app.post("/api/asset-library/libraries")
 async def create_asset_library(payload: AssetLibraryRequest):
