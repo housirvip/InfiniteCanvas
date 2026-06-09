@@ -24,6 +24,8 @@ import tempfile
 import math
 import shlex
 import functools
+import html
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
 import httpx
@@ -164,12 +166,14 @@ GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
 GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main"
+GITHUB_UPDATE_NOTES_URL = GITHUB_RAW_ROOT + "/static/update-notes.json"
 MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/daniel8152/Infinite-Canvas"
 MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/daniel8152/Infinite-Canvas/raw/main"
 # ModelScope 仓库默认分支为 master；raw 网页路径会返回 HTML，必须用仓库文件 API 才能拿到纯文本
 # 注意：.ai 站命名空间为小写 daniel8152，API 路径大小写敏感（推送/文件 API 用大写会 404/拒绝）
 MODELSCOPE_FILE_API_ROOT = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo?Revision=master&FilePath="
 MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
+MODELSCOPE_UPDATE_NOTES_URL = MODELSCOPE_FILE_API_ROOT + "static/update-notes.json"
 MODELSCOPE_TREE_URL = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
 
 @app.on_event("startup")
@@ -1280,6 +1284,78 @@ def current_app_version():
     except Exception:
         return ""
 
+def update_notes_path() -> str:
+    return os.path.join(STATIC_DIR, "update-notes.json")
+
+def safe_update_notes(payload: Any, version: str = "") -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    items = payload.get("items")
+    if not isinstance(items, list):
+        items = []
+    clean_items = []
+    for item in items[:30]:
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("title") or "").strip()
+            if not text:
+                continue
+            clean_items.append({
+                "type": str(item.get("type") or "update").strip()[:32],
+                "text": text[:500],
+            })
+        else:
+            text = str(item or "").strip()
+            if text:
+                clean_items.append({"type": "update", "text": text[:500]})
+    notes_version = str(payload.get("version") or version or "").strip()
+    history = payload.get("history")
+    selected_history = {}
+    if version and isinstance(history, list):
+        for entry in history:
+            if isinstance(entry, dict) and str(entry.get("version") or "").strip() == version:
+                selected_history = safe_update_notes(entry, version)
+                break
+    if selected_history:
+        return selected_history
+    return {
+        "version": notes_version,
+        "updated_at": str(payload.get("updated_at") or payload.get("date") or "").strip(),
+        "items": clean_items,
+    }
+
+def read_local_update_notes(version: str = "") -> Dict[str, Any]:
+    try:
+        path = update_notes_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return safe_update_notes(json.load(f), version)
+    except Exception:
+        pass
+    return {"version": version or current_app_version(), "updated_at": "", "items": []}
+
+def fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"ok": False, "error": "", "url": url, "version": version, "items": []}
+    if not url:
+        info["error"] = "missing url"
+        return info
+    try:
+        resp = requests.get(
+            f"{url}{'&' if '?' in url else '?'}t={int(time.time())}",
+            headers={"User-Agent": "Infinite-Canvas-Updater"},
+            timeout=timeout,
+            proxies=urllib.request.getproxies() or None,
+        )
+        if 200 <= resp.status_code < 400:
+            payload = json.loads(resp.content.decode("utf-8", errors="replace"))
+            notes = safe_update_notes(payload, version)
+            info.update(notes)
+            info["ok"] = True
+        else:
+            info["error"] = f"HTTP {resp.status_code}"
+    except Exception as exc:
+        info["error"] = str(exc)
+    return info
+
 def versioned_static_html(html: str) -> str:
     version = current_app_version()
     if not version:
@@ -1460,14 +1536,17 @@ def app_info():
                 "repo_url": GITHUB_REPO_URL,
                 "version_url": GITHUB_VERSION_URL,
                 "tree_url": GITHUB_TREE_URL,
+                "update_notes_url": GITHUB_UPDATE_NOTES_URL,
             },
             "modelscope": {
                 "label": "ModelScope",
                 "repo_url": MODELSCOPE_REPO_URL,
                 "version_url": MODELSCOPE_VERSION_URL,
                 "tree_url": MODELSCOPE_TREE_URL,
+                "update_notes_url": MODELSCOPE_UPDATE_NOTES_URL,
             },
         },
+        "update_notes": read_local_update_notes(version),
     }
 
 def connectivity_probe(name: str, url: str, timeout: float = 5.0) -> Dict[str, Any]:
@@ -1614,11 +1693,42 @@ def check_update():
             if not best or version_gt(item["version"], best["version"]):
                 best = {"source": item["source"], "version": item["version"]}
     update_available = bool(best and version_gt(best["version"], current))
+    notes_by_source: Dict[str, Any] = {}
+    if best and best.get("version"):
+        notes_urls = {
+            "github": GITHUB_UPDATE_NOTES_URL,
+            "modelscope": MODELSCOPE_UPDATE_NOTES_URL,
+        }
+        notes_holder: Dict[str, Dict[str, Any]] = {}
+        def _notes_probe(key: str, url: str):
+            notes_holder[key] = fetch_remote_update_notes(url, best["version"], timeout=5.0)
+            notes_holder[key]["source"] = key
+        notes_threads = [
+            Thread(target=_notes_probe, args=("github", notes_urls["github"]), daemon=True),
+            Thread(target=_notes_probe, args=("modelscope", notes_urls["modelscope"]), daemon=True),
+        ]
+        for t in notes_threads:
+            t.start()
+        for t in notes_threads:
+            t.join(timeout=5.5)
+        notes_by_source = {
+            "github": notes_holder.get("github") or {"ok": False, "error": "检测超时（超过 5s）", "url": notes_urls["github"], "source": "github", "items": []},
+            "modelscope": notes_holder.get("modelscope") or {"ok": False, "error": "检测超时（超过 5s）", "url": notes_urls["modelscope"], "source": "modelscope", "items": []},
+        }
+        best_notes = notes_by_source.get(str(best.get("source") or "")) or {}
+        if not best_notes.get("ok"):
+            for item in notes_by_source.values():
+                if item.get("ok"):
+                    best_notes = item
+                    break
+        best["update_notes"] = best_notes if best_notes.get("ok") else {"version": best["version"], "items": []}
     return {
         "current": current,
         "github": github,
         "modelscope": modelscope,
         "latest": best,
+        "update_notes": best.get("update_notes") if best else {},
+        "update_notes_sources": notes_by_source,
         "update_available": update_available,
         "reachable": bool(github["ok"] or modelscope["ok"]),
     }
@@ -1996,6 +2106,22 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         restart_scheduled = False
         if req.auto_restart and updated:
             restart_scheduled = schedule_self_restart(req.restart_delay)
+        new_version = ""
+        try:
+            staged_version = os.path.join(staging_root, "VERSION")
+            if os.path.exists(staged_version):
+                with open(staged_version, "r", encoding="utf-8") as f:
+                    new_version = (f.read().strip().splitlines() or [""])[0].strip()
+        except Exception:
+            new_version = ""
+        notes_file = os.path.join(staging_root, "static", "update-notes.json")
+        update_notes = {}
+        try:
+            if os.path.exists(notes_file):
+                with open(notes_file, "r", encoding="utf-8") as f:
+                    update_notes = safe_update_notes(json.load(f), new_version)
+        except Exception:
+            update_notes = {}
         return {
             "ok": True,
             "source": source,
@@ -2005,6 +2131,8 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             "download_errors": download_errors,
             "updated": updated,
             "count": len(updated),
+            "version": new_version,
+            "update_notes": update_notes,
             "backup_dir": backup_root if os.path.exists(backup_root) else "",
             "restart_required": True,
             "restart_scheduled": restart_scheduled,
@@ -2153,6 +2281,8 @@ class AIReference(BaseModel):
     url: str = ""
     name: str = ""
     role: str = ""
+    kind: str = ""
+    mime: str = ""
 
 class OnlineImageRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
@@ -5016,6 +5146,66 @@ def reference_to_data_url(ref, max_size=None):
         encoded = base64.b64encode(f.read()).decode("ascii")
     return f"data:{content_type_for_path(path)};base64,{encoded}"
 
+def is_image_reference(ref):
+    if not isinstance(ref, dict):
+        return False
+    kind = str(ref.get("kind") or "").strip().lower()
+    mime = str(ref.get("mime") or "").strip().lower()
+    url = str(ref.get("url") or "").strip().lower()
+    if kind:
+        return kind == "image"
+    if mime:
+        return mime.startswith("image/")
+    return bool(re.search(r"\.(png|jpe?g|webp|gif|bmp|tiff?)(\?|#|$)", url))
+
+def image_references(refs):
+    return [ref for ref in (refs or []) if is_image_reference(ref)]
+
+TEXT_ATTACHMENT_EXTS = {".txt", ".md", ".markdown", ".json", ".csv", ".log", ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".xml", ".yaml", ".yml"}
+MAX_ATTACHMENT_TEXT_CHARS = 12000
+
+def read_text_attachment(path, limit=MAX_ATTACHMENT_TEXT_CHARS):
+    ext = os.path.splitext(path or "")[1].lower()
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        if ext == ".docx":
+            with zipfile.ZipFile(path) as archive:
+                raw = archive.read("word/document.xml")
+            root = ET.fromstring(raw)
+            parts = []
+            for node in root.iter():
+                if node.tag.endswith("}t") and node.text:
+                    parts.append(node.text)
+                elif node.tag.endswith("}p"):
+                    parts.append("\n")
+            return html.unescape("".join(parts)).strip()[:limit]
+        if ext in TEXT_ATTACHMENT_EXTS:
+            with open(path, "rb") as f:
+                data = f.read(min(os.path.getsize(path), limit * 4))
+            for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+                try:
+                    return data.decode(encoding, errors="strict").strip()[:limit]
+                except UnicodeDecodeError:
+                    continue
+            return data.decode("utf-8", errors="replace").strip()[:limit]
+    except Exception as exc:
+        print(f"[chat] failed to read attachment text {path}: {exc}")
+    return ""
+
+def attachment_text_blocks(refs, limit_each=MAX_ATTACHMENT_TEXT_CHARS):
+    blocks = []
+    for ref in (refs or [])[:4]:
+        if not isinstance(ref, dict) or is_image_reference(ref):
+            continue
+        path = output_file_from_url(ref.get("url", ""))
+        text = read_text_attachment(path, limit_each) if path else ""
+        if not text:
+            continue
+        name = ref.get("name") or os.path.basename(path)
+        blocks.append(f"附件：{name}\n{text}")
+    return blocks
+
 def media_reference_to_url(value, max_image_size=None):
     if not isinstance(value, str) or not value:
         return ""
@@ -5981,6 +6171,46 @@ def parse_size_pair(size):
         return 0, 0
     return int(match.group(1)), int(match.group(2))
 
+CHAT_RATIO_SIZE_OPTIONS = {
+    "1:1": ("1024x1024", "1536x1536"),
+    "2:3": ("720x1080", "1024x1536"),
+    "3:2": ("1080x720", "1536x1024"),
+    "3:4": ("1008x1344", "1536x2048"),
+    "4:3": ("1344x1008", "2048x1536"),
+    "9:16": ("720x1280", "1080x1920"),
+    "16:9": ("1280x720", "1920x1080"),
+}
+
+def chat_prompt_size_override(message, current_size=""):
+    text = str(message or "")
+    direct = re.search(r"(?<!\d)([1-9]\d{2,4})\s*[xX×*]\s*([1-9]\d{2,4})(?!\d)", text)
+    if direct:
+        width, height = int(direct.group(1)), int(direct.group(2))
+        if width >= 256 and height >= 256:
+            return f"{width}x{height}"
+
+    normalized = (
+        text.replace("：", ":")
+        .replace("﹕", ":")
+        .replace("∶", ":")
+        .replace("比", ":")
+        .replace("／", "/")
+        .replace("/", ":")
+    )
+    ratio_match = re.search(r"(?<!\d)(1|2|3|4|9|16)\s*:\s*(1|2|3|4|9|16)(?!\d)", normalized)
+    if not ratio_match:
+        return ""
+    ratio = f"{int(ratio_match.group(1))}:{int(ratio_match.group(2))}"
+    options = CHAT_RATIO_SIZE_OPTIONS.get(ratio)
+    if not options:
+        return ""
+    width, height = parse_size_pair(current_size)
+    wants_2k = bool(re.search(r"(?i)\b2\s*k\b|2K|高清|高分辨率", text))
+    use_2k = wants_2k or max(width, height) >= 1500
+    return options[1] if use_2k else options[0]
+
+# GPT-Image-2 限制：长边最大 3840，主要受最大像素限制（约 829 万 = 3840x2160）。
+# 这里只用于上游报错后给出友好的像素上限提示；不对尺寸做任何缩小（用户选什么就原样发送）。
 GPT_IMAGE2_MAX_EDGE = 3840
 GPT_IMAGE2_MAX_PIXELS = 8_294_400
 GPT_IMAGE2_MIN_PIXELS = 655_360
@@ -6028,21 +6258,10 @@ def normalize_gpt_image_2_size(size):
 def gpt_image_2_size_error_message(size):
     width, height = parse_size_pair(size)
     display_size = size or "未指定"
-    if width == 4096 and height == 4096:
-        return (
-            "GPT-Image-2 不支持 4K 1:1 的 4096x4096。"
-            "如果需要输出 4096x4096，请切换到 nano-banana；"
-            "如果继续使用 GPT，请改成 2K 或长边不超过 3840、总像素不超过约 829 万的尺寸。"
-        )
-    if width and height and (max(width, height) > GPT_IMAGE2_MAX_EDGE or width * height > GPT_IMAGE2_MAX_PIXELS):
-        return (
-            f"GPT-Image-2 不支持当前尺寸 {display_size}。"
-            "该尺寸超过 GPT 支持范围；如果要保留这个高分辨率，请切换到 nano-banana，"
-            "或把 GPT 尺寸改成 2K / 3840x2160 / 2160x3840 这类更小规格。"
-        )
     return (
-        f"GPT-Image-2 不支持当前尺寸 {display_size}。"
-        "请换成 GPT 支持的分辨率，或切换到 nano-banana 生成更高分辨率。"
+        f"GPT-Image-2 不支持当前尺寸 {display_size}：它有最大像素限制"
+        "（长边最大 3840、总像素约 829 万）。请改用更小的尺寸，"
+        "或切换到 nano-banana 生成更高分辨率。"
     )
 
 def gpt_image_2_size_exceeds_supported(size):
@@ -6973,11 +7192,8 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_volcengine_provider_image(prompt, size, model, reference_images, provider)
     is_gpt2 = is_gpt_image_2_model(model)
     is_apimart = is_apimart_provider(provider)
-    if is_gpt2 and not is_apimart:
-        # GPT-Image-2 支持任意宽高比/分辨率，只受“最大像素 + 最大长边”限制。
-        # 因此自定义尺寸原样发送即可；只有超过上限（典型是 4K，像素超约 829 万）时才按原比例等比缩小，
-        # 避免上游报错，同时尽量保留用户选择的宽高比。（APIMart 走自己的 ratio+resolution 映射，不在此处理。）
-        size = normalize_gpt_image_2_size(size)
+    # 不对 GPT 尺寸做任何缩小/拦截：用户选什么尺寸就原样发给上游；
+    # 若超过 GPT 的最大像素限制被上游拒绝，再由 friendly_image_error_detail 给出友好的像素上限提示。
     quality = str(quality or "").strip().lower()
     if quality not in {"low", "medium", "high"}:
         quality = ""
@@ -7107,10 +7323,14 @@ def upstream_message_from_record(item):
     role = item.get("role")
     if role not in {"user", "assistant"} or item.get("type") == "image":
         return None
-    refs = item.get("attachments") or []
-    if refs and role == "user":
-        content = [{"type": "text", "text": item.get("content", "")}]
-        for ref in refs[:4]:
+    attachments = item.get("attachments") or []
+    if attachments and role == "user":
+        text = item.get("content", "")
+        blocks = attachment_text_blocks(attachments)
+        if blocks:
+            text = f"{text}\n\n以下是用户上传附件的可读内容，请在回答时参考：\n\n" + "\n\n---\n\n".join(blocks)
+        content = [{"type": "text", "text": text}]
+        for ref in image_references(attachments)[:4]:
             url = reference_to_data_url(ref)
             if url:
                 content.append({"type": "image_url", "image_url": {"url": url}})
@@ -7126,6 +7346,9 @@ AGENT_EDIT_KEYWORDS = [
     "修改", "改成", "换成", "调整", "优化", "编辑", "重绘", "上一张", "刚才",
     "这张", "那张", "参考图", "改图", "edit", "modify", "change", "revise",
 ]
+CN_NUMERAL_MAP = {
+    "一": 1, "二": 2, "两": 2, "俩": 2, "三": 3, "四": 4,
+}
 
 def latest_chat_image_refs(conversation, limit=1):
     refs = []
@@ -7149,6 +7372,38 @@ def image_size_from_reference(ref):
     except Exception as exc:
         print(f"[chat-agent] failed to read reference image size: {exc}")
     return ""
+
+def chat_requested_image_count(message):
+    text = str(message or "")
+    match = re.search(r"(?<!\d)([1-4])\s*(?:张|幅|个|组|套)(?!\d)", text)
+    if match:
+        return max(1, min(4, int(match.group(1))))
+    match = re.search(r"([一二两俩三四])\s*(?:张|幅|个|组|套)", text)
+    if match:
+        return max(1, min(4, CN_NUMERAL_MAP.get(match.group(1), 1)))
+    return 1
+
+def chat_split_parallel_prompts(prompt, count):
+    text = str(prompt or "").strip()
+    if count <= 1:
+        return [text]
+    noun_match = re.search(r"(.+?)(?:的)?(海报|头像|壁纸|插画|照片|图片|图像)\s*$", text)
+    if not noun_match:
+        return [text] * count
+    prefix = noun_match.group(1).strip()
+    suffix = noun_match.group(2)
+    prefix = re.sub(r"(?:再)?(?:生成|画|绘制|制作|创建)\s*[1-4一二两俩三四]?\s*(?:张|幅|个|组|套)?", "", prefix).strip()
+    prefix = re.sub(r"[,，、\s]+$", "", prefix).strip()
+    if not prefix:
+        return [text] * count
+    candidates = [
+        item.strip(" ，,、")
+        for item in re.split(r"\s*(?:和|与|、|，|,|\+|＋)\s*", prefix)
+        if item.strip(" ，,、")
+    ]
+    if len(candidates) < count:
+        return [text] * count
+    return [f"{item}的{suffix}" for item in candidates[:count]]
 
 def pick_chat_image_provider(provider_id="", fallback_id=""):
     providers = [p for p in load_api_providers() if p.get("enabled", True) and (p.get("image_models") or [])]
@@ -7365,10 +7620,14 @@ async def upload_ai_reference(files: List[UploadFile] = File(...)):
     image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
     video_exts = {".mp4", ".webm", ".mov", ".m4v"}
     audio_exts = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+    doc_exts = {".pdf", ".txt", ".md", ".markdown", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".json", ".zip", ".yaml", ".yml", ".log"}
+    max_upload_bytes = 50 * 1024 * 1024
     for file in files:
         content = await file.read()
         if not content:
             continue
+        if len(content) > max_upload_bytes:
+            raise HTTPException(status_code=413, detail=f"{file.filename or '文件'} 超过 50MB，无法上传")
         ext = os.path.splitext(file.filename or "")[1].lower()
         content_type = (file.content_type or "").lower()
         kind = "image"
@@ -7384,13 +7643,19 @@ async def upload_ai_reference(files: List[UploadFile] = File(...)):
             kind = "image"
             if ext not in image_exts:
                 ext = ".jpg" if "jpeg" in content_type else ".webp" if "webp" in content_type else ".gif" if "gif" in content_type else ".png"
+        elif ext in doc_exts or content_type.startswith(("text/", "application/")):
+            kind = "file"
+            if not ext:
+                ext = mimetypes.guess_extension(content_type) or ".bin"
         else:
-            continue
+            kind = "file"
+            if not ext:
+                ext = ".bin"
         filename = f"ai_ref_{uuid.uuid4().hex[:12]}{ext}"
         path = output_path_for(filename, "input")
         with open(path, "wb") as f:
             f.write(content)
-        uploaded.append({"url": output_url_for(filename, "input"), "name": file.filename or filename, "kind": kind})
+        uploaded.append({"url": output_url_for(filename, "input"), "name": file.filename or filename, "kind": kind, "mime": content_type})
     return {"files": uploaded}
 
 def _local_upload_kind_ext(filename, content_type):
@@ -8787,9 +9052,10 @@ async def build_online_image_result(payload: OnlineImageRequest):
     default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
     model = selected_model(payload.model, default_model)
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
+    image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
     async def generate_one():
-        image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, refs, provider["id"])
+        image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, image_refs, provider["id"])
         local_url = await save_ai_image_to_output(image_data, prefix="online_")
         return local_url, raw_item
     try:
@@ -8984,6 +9250,9 @@ def video_submit_url_candidates(provider, base_url):
     if is_apimart_provider(provider):
         return [f"{base_url}/videos/generations" if base_url.endswith("/v1") else f"{base_url}/v1/videos/generations"]
     if is_volcengine_provider(provider):
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.path and parsed.path.rstrip("/"):
+            return [base_url]
         return [f"{base_url}/api/v3/contents/generations/tasks"]
     if is_yuli_provider(provider):
         return [f"{base_url}/v1/video/create"]
@@ -8994,6 +9263,9 @@ def video_task_url_candidates(provider, base_url, task_id, submit_url=""):
         task_path = f"{base_url}/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/tasks/{task_id}"
         return [f"{task_path}?language=zh"]
     if is_volcengine_provider(provider):
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.path and parsed.path.rstrip("/"):
+            return [f"{base_url}/{task_id}"]
         return [f"{base_url}/api/v3/contents/generations/tasks/{task_id}"]
     if is_yuli_provider(provider):
         # 玉玉API 两种视频格式：OpenAI（/v1/videos/{id}）与原生（/v1/video/query?id=）。
@@ -9216,6 +9488,7 @@ async def canvas_video(payload: CanvasVideoRequest):
     is_apimart = is_apimart_provider(provider)
     is_volcengine = is_volcengine_provider(provider)
     is_yuli = is_yuli_provider(provider)
+    volc_is_proxy = bool(is_volcengine and urllib.parse.urlparse(base_url).path.rstrip("/"))
     submit_urls = video_submit_url_candidates(provider, base_url)
     submit_url = submit_urls[0]
     requested_model = selected_model(payload.model, "veo3-fast")
@@ -9355,7 +9628,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["generate_audio"] = True
             else:
                 # 非 APIMart：data URL 方式（OpenAI / ComflyAI 接口）
-                if is_volcengine:
+                if is_volcengine and not volc_is_proxy:
                     text = str(payload.prompt or "").strip()
                     volc_model = selected_model(payload.model, "doubao-seedance-2-0-fast-260128")
                     body = {
@@ -9391,12 +9664,9 @@ async def canvas_video(payload: CanvasVideoRequest):
                             "type": "image_url",
                             "image_url": {"url": url},
                         }
-                        # 火山视频接口要求每个 image 内容项都必须带 role。
-                        # volcengine_content_role 对“空 role + image”会返回 None（这是为纯生图
-                        # 路径准备的，避免被火山误判为 r2v）；但在视频生成场景里，图片本就是参考帧，
-                        # 缺省 role 必须回退为 reference_image，否则 mac 等未显式指定首/尾帧 role 的
-                        # 请求会报 "role must be specified for image contents"。
-                        role = volcengine_content_role(ref.role, "image") or "reference_image"
+                        # 火山视频接口要求每个 image 内容项都必须带 role；图生视频缺省应按首帧处理。
+                        # reference_image 会被 seedance 后端推断成 r2v，导致 task_type 不支持。
+                        role = volcengine_content_role(ref.role, "image") or "first_frame"
                         item["role"] = role
                         body["content"].append(item)
                         image_like_urls.add(url)
@@ -9411,7 +9681,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                             body["content"].append({
                                 "type": "image_url",
                                 "image_url": {"url": media_url},
-                                "role": "reference_image",
+                                "role": "first_frame",
                             })
                             image_like_urls.add(media_url)
                             continue
@@ -10860,6 +11130,7 @@ async def chat(payload: ChatRequest, request: Request, x_user_id: str = Header(d
         conversation["title"] = display_title(payload.message)
 
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
+    image_refs = image_references(refs)
     user_message = {
         "id": uuid.uuid4().hex,
         "role": "user",
@@ -10877,12 +11148,13 @@ async def chat(payload: ChatRequest, request: Request, x_user_id: str = Header(d
         provider = get_api_provider(image_provider_id)
         default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
         model = selected_model(payload.image_model or payload.model, default_model)
+        image_size = chat_prompt_size_override(payload.message, payload.size) or payload.size
         try:
-            image_data, raw = await generate_ai_image(payload.message, payload.size, payload.quality, model, refs, provider["id"])
+            image_data, raw = await generate_ai_image(payload.message, image_size, payload.quality, model, image_refs, provider["id"])
             local_url = await save_ai_image_to_output(image_data, prefix="chat_")
         except httpx.HTTPStatusError as exc:
             text = exc.response.text or ""
-            detail = friendly_image_error_detail(text, payload.size, model) or f"上游生图接口错误：{text[:300]}"
+            detail = friendly_image_error_detail(text, image_size, model) or f"上游生图接口错误：{text[:300]}"
             raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
         except httpx.HTTPError as exc:
             log_net_error(f"对话生图 网络/TLS错误 model={model}", exc)
@@ -10895,6 +11167,7 @@ async def chat(payload: ChatRequest, request: Request, x_user_id: str = Header(d
             "image_url": local_url,
             "created_at": now_ms(),
             "model": model,
+            "size": image_size,
             "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
         }
     else:
@@ -10952,6 +11225,7 @@ async def chat_agent(payload: ChatRequest, request: Request, x_user_id: str = He
         conversation["title"] = display_title(payload.message)
 
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
+    image_refs = image_references(refs)
     user_message = {
         "id": uuid.uuid4().hex,
         "role": "user",
@@ -10964,9 +11238,9 @@ async def chat_agent(payload: ChatRequest, request: Request, x_user_id: str = He
     conversation["updated_at"] = now_ms()
     save_conversation(user_id, conversation)
 
-    decision = await decide_chat_agent_action(payload, conversation, refs)
+    decision = await decide_chat_agent_action(payload, conversation, image_refs)
     action = decision.get("action") or "chat"
-    tool_refs = refs[:]
+    tool_refs = image_refs[:]
     inherited_size = ""
     if action == "edit_image" and not tool_refs:
         tool_refs = latest_chat_image_refs(conversation, 1)
@@ -10979,10 +11253,17 @@ async def chat_agent(payload: ChatRequest, request: Request, x_user_id: str = He
         default_model = (image_provider.get("image_models") or [IMAGE_MODEL])[0]
         model = selected_model(payload.image_model or default_model, default_model)
         prompt = decision.get("prompt") or payload.message
-        image_size = inherited_size or payload.size
+        prompt_size = chat_prompt_size_override(payload.message, payload.size) or chat_prompt_size_override(prompt, payload.size)
+        image_size = prompt_size or inherited_size or payload.size
+        requested_count = 1 if action == "edit_image" else chat_requested_image_count(payload.message)
+        prompts = chat_split_parallel_prompts(prompt, requested_count)
+        local_urls = []
+        raw_items = []
         try:
-            image_data, raw = await generate_ai_image(prompt, image_size, payload.quality, model, tool_refs, image_provider["id"])
-            local_url = await save_ai_image_to_output(image_data, prefix="chat_")
+            for item_prompt in prompts:
+                image_data, raw = await generate_ai_image(item_prompt, image_size, payload.quality, model, tool_refs, image_provider["id"])
+                local_urls.append(await save_ai_image_to_output(image_data, prefix="chat_"))
+                raw_items.append(raw)
         except httpx.HTTPStatusError as exc:
             text = exc.response.text or ""
             detail = friendly_image_error_detail(text, image_size, model) or f"上游生图接口错误：{text[:300]}"
@@ -10990,20 +11271,24 @@ async def chat_agent(payload: ChatRequest, request: Request, x_user_id: str = He
         except httpx.HTTPError as exc:
             log_net_error(f"对话生图 网络/TLS错误 model={model}", exc)
             raise HTTPException(status_code=502, detail=f"请求上游生图接口失败：{exc}") from exc
+        local_url = local_urls[0] if local_urls else ""
         assistant_message = {
             "id": uuid.uuid4().hex,
             "role": "assistant",
             "type": "image",
             "content": prompt,
             "image_url": local_url,
+            "image_urls": local_urls,
             "created_at": now_ms(),
             "model": model,
             "provider": image_provider["id"],
             "size": image_size,
+            "image_count": len(local_urls),
+            "prompts": prompts,
             "agent_action": action,
             "agent_reply": decision.get("reply") or "",
             "used_references": tool_refs,
-            "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
+            "raw_usage": raw_items[0].get("usage") if raw_items and isinstance(raw_items[0], dict) else None,
         }
     else:
         assistant_message = await build_chat_text_reply(payload, conversation)

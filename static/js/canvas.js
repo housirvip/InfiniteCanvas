@@ -12269,25 +12269,44 @@ function copySelectedNodes(){
     if(el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) return;
     const toCopy = [...selected].map(id => nodes.find(n => n.id === id)).filter(Boolean);
     if(!toCopy.length) return;
-    clipboard = JSON.parse(JSON.stringify(serializableCanvasNodes(toCopy)));
+    const ids = new Set(toCopy.map(n => n.id));
+    const pickedConnections = (connections || []).filter(c => ids.has(c.from) && ids.has(c.to)).map(c => ({...c}));
+    clipboard = {
+        nodes:JSON.parse(JSON.stringify(serializableCanvasNodes(toCopy))),
+        connections:JSON.parse(JSON.stringify(pickedConnections))
+    };
+}
+function clipboardNodeCount(){
+    if(Array.isArray(clipboard)) return clipboard.length;
+    if(Array.isArray(clipboard?.nodes)) return clipboard.nodes.length;
+    return 0;
 }
 function pasteNodes(){
-    if(!canvas || !clipboard?.length) return;
+    if(!canvas || !clipboard) return;
+    const clipNodes = Array.isArray(clipboard) ? clipboard : (Array.isArray(clipboard.nodes) ? clipboard.nodes : []);
+    const clipConnections = Array.isArray(clipboard?.connections) ? clipboard.connections : [];
+    if(!clipNodes.length) return;
     pushUndo();
-    const xs = clipboard.map(n => n.x), ys = clipboard.map(n => n.y);
+    const xs = clipNodes.map(n => n.x), ys = clipNodes.map(n => n.y);
     const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
     const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
     const dx = lastMouseBoard.x - cx;
     const dy = lastMouseBoard.y - cy;
     const idMap = new Map();
-    const copies = clipboard.map(n => { const c = cloneNode(n, dx, dy); idMap.set(n.id, c.id); return c; });
+    const copies = clipNodes.map(n => { const c = cloneNode(n, dx, dy); idMap.set(n.id, c.id); return c; });
     copies.forEach(c => {
         if((c.type === 'group' || c.type === 'promptGroup') && c.items)
             c.items = c.items.map(id => idMap.get(id) || id);
     });
+    const newConnections = clipConnections
+        .map(c => ({...c, id:uid('c'), from:idMap.get(c.from), to:idMap.get(c.to)}))
+        .filter(c => c.from && c.to);
     nodes.push(...copies);
+    connections.push(...newConnections);
     selected.clear();
     copies.forEach(c => selected.add(c.id));
+    sanitizeConnections();
+    syncGeneratorInputs();
     render();
     scheduleSave();
 }
@@ -13269,7 +13288,7 @@ window.addEventListener('keydown', e => {
     if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
         const tag = document.activeElement?.tagName;
         if(tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
-        if(clipboard?.length) {
+        if(clipboardNodeCount()) {
             const pasteRequestedAt = Date.now();
             setTimeout(() => {
                 if(!canvas) return;
