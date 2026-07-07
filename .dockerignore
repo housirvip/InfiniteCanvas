@@ -1,0 +1,37 @@
+# Windows 打包的 Python 运行时和离线 wheel 包
+python/
+packages/
+get-pip.py
+
+# Windows/Mac 脚本
+*.bat
+*.command
+*.ps1
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 文档和资源
+*.md
+*.png
+*.txt
+!requirements.txt
+!VERSION
+
+# 工具目录
+tools/
+
+# 运行时生成的数据（通过 volume 挂载）
+output/
+assets/
+data/
+history.json
+global_config.json
+__pycache__/
+*.pyc

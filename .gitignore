@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+venv/
+.venv/
+
+# Windows 打包的 Python 运行时和离线 wheel 包
+python/
+packages/
+get-pip.py
+
+# 运行时数据（用户画布、对话、素材等）
+data/*
+!data/asset_library.json
+output/
+assets/
+history.json
+global_config.json
+
+# API 密钥配置目录
+API/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Codegraph
+.codegraph/
