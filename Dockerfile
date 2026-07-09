@@ -16,8 +16,8 @@ RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ \
     --trusted-host mirrors.aliyun.com \
     -r requirements.txt
 
-# ========== 第3层：后端代码（偶尔变动）==========
-COPY API/ API/
+# ========== 第3层：后端配置目录和 CLI（偶尔变动）==========
+RUN mkdir -p API && touch API/.env
 COPY CLI/ CLI/
 
 # ========== 第4层：前端静态资源（频繁变动）==========
@@ -31,4 +31,4 @@ RUN mkdir -p data output assets/input assets/output assets/library assets/upload
 
 EXPOSE 3000
 
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "mkdir -p API && touch API/.env && exec python main.py"]
