@@ -9,7 +9,7 @@ services:
       - ./data:/app/data
       - ./output:/app/output
       - ./assets:/app/assets
-      - ./API/.env:/app/API/.env
+      - ./API:/app/API
       - ./workflows:/app/workflows
     environment:
       - TZ=Asia/Shanghai
