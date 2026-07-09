@@ -3,7 +3,7 @@ services:
     build: .
     container_name: infinite-canvas
     ports:
-      - "3010:3000"
+      - "3020:3000"
     volumes:
       # 持久化数据目录，容器重建后数据不丢失
       - ./data:/app/data
