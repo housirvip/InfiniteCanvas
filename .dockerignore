@@ -1,12 +1,27 @@
-# Windows 打包的 Python 运行时和离线 wheel 包
-python/
-packages/
-get-pip.py
-
-# Windows/Mac 脚本
-*.bat
-*.command
-*.ps1
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Git
 .git/
@@ -17,21 +32,25 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 
-# 文档和资源
-*.md
-*.png
-*.txt
-!requirements.txt
-!VERSION
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# 工具目录
-tools/
-
-# 运行时生成的数据（通过 volume 挂载）
+# 数据和输出（通过 volume 挂载，不需要打包）
+data/
 output/
 assets/
-data/
-history.json
-global_config.json
-__pycache__/
-*.pyc
+workflows/
+
+# 日志
+*.log
+logs/
+
+# 其他
+.DS_Store
+Thumbs.db
+README.md
+LICENSE
