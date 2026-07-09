@@ -31,4 +31,4 @@ RUN mkdir -p data output assets/input assets/output assets/library assets/upload
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "mkdir -p API && touch API/.env && exec python main.py"]
+CMD ["sh", "-c", "mkdir -p API && if [ -d API/.env ]; then rmdir API/.env; fi && touch API/.env && exec python main.py"]
