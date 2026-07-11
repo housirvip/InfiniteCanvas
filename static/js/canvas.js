@@ -436,6 +436,7 @@ let managerSelectedWorkflowIds = new Set();
 let managerSelectedPromptIds = new Set();
 let activeCanvasWorkflowCategoryId = '';
 const activeCanvasTaskPolls = new Set();
+const activeRhResumes = new Set();
 let hoveredConnectionId = '';
 let lastMouseBoard = {x: 0, y: 0};
 let undoStack = [];
@@ -9868,6 +9869,7 @@ async function runRhNode(nodeId, opts={}){
     if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs:media.refs, cascadeTargetId})];
     if(!opts.cascade) node.running = true;
     refreshRunNodes(node, out);
+    let rhGuardTaskId = '';
     try {
         const nodeInfoList = await rhBuildNodeInfoList(node, media);
         const workflowExtras = mode === 'workflow' ? await rhBuildWorkflowRequestExtras(node, media, nodeInfoList) : {};
@@ -9891,6 +9893,7 @@ async function runRhNode(nodeId, opts={}){
             const rhPending = (out._pending || []).find(p => p.id === pendingId);
             if(rhPending) rhPending.rhTaskId = taskId;
         }
+        rhGuardTaskId = taskId; activeRhResumes.add(taskId);
         let result = null;
         for(let i = 0; i < rhPollMax; i++){
             if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
@@ -9932,6 +9935,7 @@ async function runRhNode(nodeId, opts={}){
         if(opts.cascade) throw err;
         alert(err.message || tr('canvas.rhFailed'));
     } finally {
+        if(rhGuardTaskId) activeRhResumes.delete(rhGuardTaskId);
         node.running = false;
         refreshRunNodes(node, out);
     }
@@ -12125,6 +12129,8 @@ async function retryRhLogQuery(logId){
     if(!log) return;
     const taskId = log.request?.task_id;
     if(!taskId) return;
+    if(activeRhResumes.has(taskId)) return;
+    activeRhResumes.add(taskId);
     log._retrying = true;
     renderCanvasLog();
     try {
@@ -12169,6 +12175,8 @@ async function retryRhLogQuery(logId){
         log.error = err.message || String(err);
         renderCanvasLog();
         setStatus(tr('canvas.queryFailed'));
+    } finally {
+        activeRhResumes.delete(taskId);
     }
 }
 function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
@@ -12601,6 +12609,8 @@ function resumeCanvasImageTasks(){
 async function resumeRhPendingTask(out, pending){
     const taskId = pending?.rhTaskId;
     if(!taskId) return;
+    if(activeRhResumes.has(taskId)) return;
+    activeRhResumes.add(taskId);
     const run = pending?.run || {};
     const nodeId = run?.node?.id || '';
     const node = nodeId ? nodes.find(n => n.id === nodeId) : null;
@@ -12640,6 +12650,8 @@ async function resumeRhPendingTask(out, pending){
         }
         addGenerationLog({run, outputs:[], runMs:nowMs() - Number(pending.startedAt || nowMs()), error:err.message || String(err)});
         scheduleSave();
+    } finally {
+        activeRhResumes.delete(taskId);
     }
 }
 function renderOutputMedia(item, useGridLayout=false){
@@ -12698,14 +12710,18 @@ function setOutputDragPreview(event, img){
     setTimeout(() => wrap.remove(), 0);
 }
 function appendOutputImages(out, images, compareRef, metas=[], layout=null){
-    const list = (images || []).filter(Boolean);
-    if(!out || !list.length) return;
+    if(!out) return;
+    let list = (images || []).filter(Boolean);
+    if(!list.length) return;
     if(layout?.type === 'grid-split'){
         out.images = [];
         out.outputLayout = layout;
     } else if(out.outputLayout) {
         delete out.outputLayout;
     }
+    const existingUrls = new Set((out.images || []).map(outputUrlValue).filter(Boolean));
+    list = list.filter(item => { const u = outputUrlValue(item); return u && !existingUrls.has(u); });
+    if(!list.length) return;
     out.images = [...(out.images || []), ...list.map((url, i) => {
         const meta = metas[i] || metas[0] || {};
         const source = url && typeof url === 'object' ? url : {};
