@@ -381,6 +381,8 @@ let videoModels = [];
 let msChatModels = [];
 let apiProviders = [];
 let comfyBackendCount = 1;
+let rhPollMax = 720;
+let rhPollIntervalMs = 2500;
 let comfyWorkflows = [];
 let comfyWorkflowCache = {};
 let runningHubWorkflowCache = {};
@@ -1471,6 +1473,8 @@ async function loadConfig(){
         apiProviders = Array.isArray(cfg.api_providers) && cfg.api_providers.length ? cfg.api_providers : defaultApiProviders();
         models.nano = imageModels.find(m => m.toLowerCase().includes('nano')) || 'nano-banana-pro';
         models.gpt = imageModels.find(m => !m.toLowerCase().includes('nano')) || cfg.image_model || 'gpt-image-2';
+        rhPollMax = cfg.rh_poll_max || rhPollMax;
+        rhPollIntervalMs = cfg.rh_poll_interval_ms || rhPollIntervalMs;
         try {
             const wf = await fetch('/api/workflows').then(r=>r.json());
             comfyWorkflows = wf.workflows || [];
@@ -9884,9 +9888,9 @@ async function runRhNode(nodeId, opts={}){
         if(!taskId) throw new Error(tr('canvas.rhNoTaskId'));
         run.request = {task_id:taskId, webappId:node.webappId, workflowId:node.workflowId, backend:'runninghub', mode};
         let result = null;
-        for(let i = 0; i < 720; i++){
+        for(let i = 0; i < rhPollMax; i++){
             if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
-            await sleep(2500);
+            await sleep(rhPollIntervalMs);
             const data = await cascadeFetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`, {}, {cascadeTargetId}).then(async r => {
                 const json = await r.json();
                 if(!r.ok || json.success === false) throw new Error(json.detail || json.error || tr('canvas.rhFailed'));

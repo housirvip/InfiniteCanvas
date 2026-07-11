@@ -548,6 +548,16 @@ APIMART_IMAGE_TASK_TIMEOUT = float(os.getenv("APIMART_IMAGE_TASK_TIMEOUT", "1800
 APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"))
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
 VIDEO_POLL_TIMEOUT = float(os.getenv("VIDEO_POLL_TIMEOUT", "1800"))
+# RunningHub 轮询配置（可通过 .env 调整）
+RUNNINGHUB_TASK_TIMEOUT = float(os.getenv("RUNNINGHUB_TASK_TIMEOUT", "3600"))
+RUNNINGHUB_POLL_INTERVAL = float(os.getenv("RUNNINGHUB_POLL_INTERVAL", "3"))
+RUNNINGHUB_QUERY_FAIL_TOLERANCE = int(os.getenv("RUNNINGHUB_QUERY_FAIL_TOLERANCE", "6"))
+RUNNINGHUB_BACKEND_IMAGE_POLL_INTERVAL = float(os.getenv("RUNNINGHUB_BACKEND_IMAGE_POLL_INTERVAL", "2"))
+RUNNINGHUB_BACKEND_OPENAPI_POLL_INTERVAL = float(os.getenv("RUNNINGHUB_BACKEND_OPENAPI_POLL_INTERVAL", "3"))
+RUNNINGHUB_PS_TASK_TIMEOUT = float(os.getenv("RUNNINGHUB_PS_TASK_TIMEOUT", "600"))
+RUNNINGHUB_FRONTEND_POLL_MAX = int(RUNNINGHUB_TASK_TIMEOUT / RUNNINGHUB_POLL_INTERVAL)
+RUNNINGHUB_FRONTEND_POLL_INTERVAL_MS = int(RUNNINGHUB_POLL_INTERVAL * 1000)
+RUNNINGHUB_PS_POLL_MAX = int(RUNNINGHUB_PS_TASK_TIMEOUT / RUNNINGHUB_POLL_INTERVAL)
 ONLINE_IMAGE_PROMPT_MAX_LENGTH = int(os.getenv("ONLINE_IMAGE_PROMPT_MAX_LENGTH", "20000"))
 VIDEO_PROMPT_MAX_LENGTH = int(os.getenv("VIDEO_PROMPT_MAX_LENGTH", "4000"))
 LLM_MESSAGE_MAX_LENGTH = int(os.getenv("LLM_MESSAGE_MAX_LENGTH", "20000"))
@@ -9479,10 +9489,10 @@ async def runninghub_upload_reference(client, provider, ref):
 
 async def wait_for_runninghub_image_task(client, provider, task_id):
     query_url = runninghub_openapi_url(provider, "query")
-    deadline = time.monotonic() + 1800
+    deadline = time.monotonic() + RUNNINGHUB_TASK_TIMEOUT
     last_payload = None
     while time.monotonic() < deadline:
-        await asyncio.sleep(2)
+        await asyncio.sleep(RUNNINGHUB_BACKEND_IMAGE_POLL_INTERVAL)
         response = await client.post(query_url, headers=runninghub_api_headers(provider), json={"taskId": task_id})
         response.raise_for_status()
         raw = response.json()
@@ -9901,10 +9911,10 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
 
 async def wait_for_runninghub_openapi_task(client, provider, task_id, output_kind=""):
     query_url = runninghub_openapi_url(provider, "query")
-    deadline = time.monotonic() + 1800
+    deadline = time.monotonic() + RUNNINGHUB_TASK_TIMEOUT
     last_payload = None
     while time.monotonic() < deadline:
-        await asyncio.sleep(3)
+        await asyncio.sleep(RUNNINGHUB_BACKEND_OPENAPI_POLL_INTERVAL)
         response = await client.post(query_url, headers=runninghub_json_headers(provider), json={"taskId": task_id})
         response.raise_for_status()
         raw = response.json()
@@ -11901,6 +11911,10 @@ async def ai_config():
         "has_api_key": bool(AI_API_KEY),
         "ms_chat_models": MODELSCOPE_CHAT_MODELS,
         "has_ms_key": bool(modelscope_api_key()),
+        "rh_poll_max": RUNNINGHUB_FRONTEND_POLL_MAX,
+        "rh_poll_interval_ms": RUNNINGHUB_FRONTEND_POLL_INTERVAL_MS,
+        "rh_query_fail_tolerance": RUNNINGHUB_QUERY_FAIL_TOLERANCE,
+        "rh_ps_poll_max": RUNNINGHUB_PS_POLL_MAX,
     }
 
 @app.get("/api/models")

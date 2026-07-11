@@ -46,6 +46,9 @@
     comfyName: '',
     comfyConfig: null,
     jobs: 0,               // 进行中的生成任务数（支持队列/并行）
+    rhPollMax: 240,
+    rhPollIntervalMs: 2500,
+    rhConfigLoaded: false,
   };
 
   function escapeHtml(v) {
@@ -231,6 +234,14 @@
   async function loadRhWorkflows(mem) {
     setMsg('正在加载 RunningHub 工作流 …');
     try {
+      if (!g.rhConfigLoaded) {
+        try {
+          const cfg = await net.apiGet('/api/config');
+          g.rhPollMax = cfg.rh_ps_poll_max || 240;
+          g.rhPollIntervalMs = cfg.rh_poll_interval_ms || 2500;
+        } catch(_) {}
+        g.rhConfigLoaded = true;
+      }
       const data = await net.apiGet('/api/runninghub/workflows');
       g.rhWorkflows = data.workflows || [];
       DX.ui.fillPicker(els.rhWorkflow, [{ value: '', label: '请选择工作流' }].concat(g.rhWorkflows.map((w) => ({ value: w.workflowId, label: w.title || w.workflowId }))), mem && mem.rhWorkflowId);
@@ -671,7 +682,7 @@
     let n = 0;
     const tick = async () => {
       n += 1;
-      if (n > 240) { jobEnd('生成超时，请重试。', 'err'); return; }
+      if (n > g.rhPollMax) { jobEnd('生成超时，请重试。', 'err'); return; }
       let res;
       try { res = await net.apiGet(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`); }
       catch (err) { jobEnd(`查询任务失败：${err.message || err}`, 'err'); return; }
@@ -679,7 +690,7 @@
       const s = String(d.status || '').toUpperCase();
       if (s === 'SUCCESS') { const items = appendResults(d.urls || [], 'rh'); const placed = await placeResults(items); jobEnd(`已生成并添加 ${placed} 张到图层。`, 'ok'); return; }
       if (s === 'FAILED') { jobEnd(`生成失败：${d.failReason || '未知错误'}`, 'err'); return; }
-      setTimeout(tick, 2500);
+      setTimeout(tick, g.rhPollIntervalMs);
     };
     tick();
   }

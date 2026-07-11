@@ -95,6 +95,9 @@ let saveTimer = null;
 let apiProviders = [];
 let comfyWorkflows = [];
 let comfyInstanceCount = 1;
+let rhPollMax = 720;
+let rhPollIntervalMs = 2500;
+let rhQueryFailTolerance = 6;
 let assetLibrary = {categories:[]};
 let assetLibraryOpen = false;
 let assetTab = 'image';
@@ -4115,6 +4118,9 @@ async function loadConfig(){
         const cfg = await fetch('/api/config').then(r => r.json());
         apiProviders = Array.isArray(cfg.api_providers) ? cfg.api_providers : [];
         comfyInstanceCount = Math.max(1, (Array.isArray(cfg.comfy_instances) ? cfg.comfy_instances : []).filter(Boolean).length || 1);
+        rhPollMax = cfg.rh_poll_max || rhPollMax;
+        rhPollIntervalMs = cfg.rh_poll_interval_ms || rhPollIntervalMs;
+        rhQueryFailTolerance = cfg.rh_query_fail_tolerance || rhQueryFailTolerance;
         // 提供商配置已就绪即先渲染参数面板，避免等工作流/RunningHub 预取完成后参数才「突然刷新出来」。
         sanitizeSmartApiSelection(settings);
         updateProviderModels();
@@ -14622,8 +14628,8 @@ async function runRunningHubGeneration(prompt, refs, runSettings=settings){
     const taskId = submit.taskId;
     if(!taskId) throw new Error(tr('smart.rhNoTaskId'));
     let queryFails = 0;
-    for(let i = 0; i < 720; i++){
-        await sleep(2500);
+    for(let i = 0; i < rhPollMax; i++){
+        await sleep(rhPollIntervalMs);
         let data;
         try {
             data = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`).then(async r => {
@@ -14632,7 +14638,7 @@ async function runRunningHubGeneration(prompt, refs, runSettings=settings){
                 return json.data || json;
             });
         } catch(err) {
-            if(++queryFails >= 6) throw err;
+            if(++queryFails >= rhQueryFailTolerance) throw err;
             continue;
         }
         queryFails = 0;
