@@ -11538,7 +11538,9 @@ async def runninghub_query(taskId: str = ""):
             response = await client.post(url, headers=runninghub_app_headers(True), json={"apiKey": api_key, "taskId": task_id})
             raw = response.json()
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"查询 RunningHub 任务失败：{exc}") from exc
+            return {"success": True, "data": {"status": "RUNNING", "urls": [], "image_items": [], "failReason": "", "code": None, "transient_error": str(exc)[:200], "raw": {}}}
+        if response.status_code >= 500 or response.status_code == 429:
+            return {"success": True, "data": {"status": "RUNNING", "urls": [], "image_items": [], "failReason": "", "code": None, "transient_error": f"upstream {response.status_code}", "raw": {}}}
         if response.status_code >= 400:
             raise HTTPException(status_code=response.status_code, detail=json.dumps(raw, ensure_ascii=False)[:800])
         code = raw.get("code") if isinstance(raw, dict) else None

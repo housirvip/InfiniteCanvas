@@ -1683,13 +1683,21 @@ async function testRhMappedPreview(){
         rhWorkflowEditorState.previewStatus = `任务已提交：${taskId}`;
         renderRhMappedPreview();
         let result = null;
+        let queryFails = 0;
         for(let i = 0; i < 720; i++){
             await new Promise(resolve => setTimeout(resolve, 2500));
-            const data = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`).then(async r => {
-                const json = await r.json();
-                if(!r.ok || json.success === false) throw new Error(json.detail || json.error || 'RunningHub 查询失败');
-                return json.data || json;
-            });
+            let data;
+            try {
+                data = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`).then(async r => {
+                    const json = await r.json();
+                    if(!r.ok || json.success === false) throw new Error(json.detail || json.error || 'RunningHub 查询失败');
+                    return json.data || json;
+                });
+            } catch(err) {
+                if(++queryFails >= 6) throw err;
+                continue;
+            }
+            queryFails = 0;
             if(data.status === 'SUCCESS'){
                 result = data;
                 break;
