@@ -12116,6 +12116,57 @@ function logTaskLabel(log){
     }
     return log?.model || '-';
 }
+async function retryRhLogQuery(logId){
+    const log = (canvas?.logs || []).find(l => l.id === logId);
+    if(!log) return;
+    const taskId = log.request?.task_id;
+    if(!taskId) return;
+    log._retrying = true;
+    renderCanvasLog();
+    try {
+        for(let i = 0; i < rhPollMax; i++){
+            const data = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`).then(async r => {
+                const json = await r.json();
+                if(!r.ok || json.success === false) throw new Error(json.detail || json.error || tr('canvas.rhFailed'));
+                return json.data || json;
+            });
+            if(data.status === 'SUCCESS'){
+                const urls = data.urls || [];
+                if(!urls.length) throw new Error(tr('canvas.rhOutputsEmpty'));
+                const nodeId = log.nodeId;
+                const node = nodeId ? nodes.find(n => n.id === nodeId) : null;
+                const fallbackNode = !node ? nodes.find(n => n.type === 'rh' && ((n.workflowId && n.workflowId === log.request?.workflowId) || (n.webappId && n.webappId === log.request?.webappId))) : null;
+                const targetNode = node || fallbackNode;
+                if(targetNode){
+                    const out = outputForNode(targetNode, 500);
+                    const compareRef = (log.refs || [])[0];
+                    appendOutputImages(out, urls, compareRef, []);
+                    mergeGeneratedOutputs(targetNode, urls, true);
+                    refreshRunNodes(targetNode, out);
+                    scheduleSave();
+                }
+                log.status = 'success';
+                log.outputs = urls;
+                log.error = '';
+                log._retrying = false;
+                renderCanvasLog();
+                setStatus(tr('canvas.retryQuerySuccess'));
+                playGenerationCompleteSound();
+                return;
+            }
+            if(data.status === 'FAILED') throw new Error(data.failReason || tr('canvas.rhFailed'));
+            await sleep(rhPollIntervalMs);
+        }
+        log._retrying = false;
+        renderCanvasLog();
+        setStatus(tr('canvas.queryTimeout'));
+    } catch(err){
+        log._retrying = false;
+        log.error = err.message || String(err);
+        renderCanvasLog();
+        setStatus(tr('canvas.queryFailed'));
+    }
+}
 function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
@@ -12133,6 +12184,7 @@ function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
         refs:run?.refs || [],
         runMs:Number(runMs || 0),
         error:error ? String(error) : '',
+        nodeId:run?.node?.id || '',
     };
     canvas.logs = [entry, ...canvas.logs].slice(0, 500);
 }
@@ -12174,6 +12226,9 @@ function renderCanvasLog(){
                 </div>
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
                 ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
+            ${log.status === 'failed' && (log.request?.task_id) && (log.request?.backend === 'runninghub' || log.nodeType === 'rh' || log.platform === 'runninghub')
+                ? `<button class="log-retry-query-btn" data-log-id="${escapeAttr(log.id)}" data-task-id="${escapeAttr(log.request.task_id)}"${log._retrying ? ' disabled' : ''}>${escapeHtml(log._retrying ? tr('canvas.querying') : tr('canvas.retryQuery'))}</button>`
+                : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
             </div>
             <div class="log-thumbs">${thumbs}</div>
@@ -12204,6 +12259,13 @@ function renderCanvasLog(){
     };
     bindCanvasLogCopy('[data-prompt]', 'prompt');
     bindCanvasLogCopy('[data-error]', 'error');
+    list.querySelectorAll('.log-retry-query-btn').forEach(btn => {
+        btn.onclick = async e => {
+            e.stopPropagation();
+            if(btn.disabled) return;
+            await retryRhLogQuery(btn.dataset.logId);
+        };
+    });
     refreshIcons();
 }
 async function importWorkflowAssetUrl(url, name='workflow'){
