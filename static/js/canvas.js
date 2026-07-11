@@ -3326,6 +3326,41 @@ function openOutputNodeMenu(nodeId, clientX, clientY){
     }
     refreshIcons();
 }
+function openOutputItemMenu(nodeId, url, clientX, clientY){
+    const node = nodes.find(n => n.id === nodeId);
+    if(!node || node.type !== 'output' || !url) return;
+    closeCreateMenu();
+    const kind = mediaKindForOutputItem(url);
+    const missing = isMissingAssetUrl(url);
+    const canPreview = !missing && ['image','video'].includes(kind);
+    const canDownload = !missing;
+    imageNodeMenu.classList.remove('output-node-menu');
+    imageNodeMenu.innerHTML = `
+        ${canPreview ? `<button class="menu-btn" data-output-item-preview="${escapeAttr(url)}"><i data-lucide="eye" class="w-4 h-4"></i><span>${tr('canvas.outputItemPreview')}</span></button>` : ''}
+        ${canDownload ? `<button class="menu-btn" data-output-item-download="${escapeAttr(url)}"><i data-lucide="download" class="w-4 h-4"></i><span>${tr('canvas.outputItemDownload')}</span></button>` : ''}
+    `;
+    const menuWidth = 200;
+    imageNodeMenu.style.left = `${Math.max(10, Math.min(window.innerWidth - menuWidth - 10, clientX))}px`;
+    imageNodeMenu.style.top = `${Math.max(10, Math.min(window.innerHeight - 120, clientY))}px`;
+    imageNodeMenu.classList.add('open');
+    const previewBtn = imageNodeMenu.querySelector('[data-output-item-preview]');
+    if(previewBtn){
+        previewBtn.onclick = e => {
+            e.stopPropagation();
+            closeImageNodeMenu();
+            openOutputLightbox(url, node);
+        };
+    }
+    const downloadBtn = imageNodeMenu.querySelector('[data-output-item-download]');
+    if(downloadBtn){
+        downloadBtn.onclick = e => {
+            e.stopPropagation();
+            closeImageNodeMenu();
+            downloadUrl(url, outputDownloadName(url)).catch(err => alert(err.message || '下载失败'));
+        };
+    }
+    refreshIcons();
+}
 function closeImageNodeMenu(){
     imageNodeMenu.classList.remove('open');
     imageNodeMenu.classList.remove('output-node-menu');
@@ -6266,6 +6301,13 @@ function bindOutputWrap(wrap, node){
     const playBtn = wrap.querySelector('.canvas-video-play');
     const del = wrap.querySelector('.output-del');
     const recoverQuery = wrap.querySelector('.output-recover-query');
+    wrap.oncontextmenu = e => {
+        const url = wrap.dataset.outputUrl || wrap.dataset.missingUrl || '';
+        if(!url || isMissingAssetUrl(url)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        openOutputItemMenu(node.id, url, e.clientX, e.clientY);
+    };
     if(img){
         img.draggable = true;
         img.ondragstart = e => {

@@ -53,6 +53,8 @@
         "canvas.outputFileActions": { zh: "文件", en: "Files" },
         "canvas.outputDownloadAllImages": { zh: "下载全部图片", en: "Download all images" },
         "canvas.outputDownloadEmpty": { zh: "没有可下载的本地图片", en: "No local images to download" },
+        "canvas.outputItemPreview": { zh: "预览", en: "Preview" },
+        "canvas.outputItemDownload": { zh: "下载", en: "Download" },
         "canvas.loopVariablePrompt": { zh: "可变提示词", en: "Variable Prompt" },
         "canvas.loopVariablePlaceholder": { zh: "例如：现在生成第[计数]个卖点", en: "Example: generate item [Count]" },
         "canvas.loopFixedPrompt": { zh: "固定提示词", en: "Fixed Prompt" },
