@@ -9887,6 +9887,10 @@ async function runRhNode(nodeId, opts={}){
         const taskId = submit.taskId;
         if(!taskId) throw new Error(tr('canvas.rhNoTaskId'));
         run.request = {task_id:taskId, webappId:node.webappId, workflowId:node.workflowId, backend:'runninghub', mode};
+        if(out){
+            const rhPending = (out._pending || []).find(p => p.id === pendingId);
+            if(rhPending) rhPending.rhTaskId = taskId;
+        }
         let result = null;
         for(let i = 0; i < rhPollMax; i++){
             if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
@@ -12590,8 +12594,53 @@ function resumeCanvasImageTasks(){
     nodes.filter(n => n.type === 'output').forEach(out => {
         (out._pending || []).forEach(p => {
             if(p.canvasTaskType === 'online-image' && p.canvasTaskId && !p.failed) pollCanvasImageTask(p.canvasTaskId, {cascadeTargetId:p.cascadeTargetId || ''});
+            if(p.rhTaskId && !p.canvasTaskId && !p.failed) resumeRhPendingTask(out, p);
         });
     });
+}
+async function resumeRhPendingTask(out, pending){
+    const taskId = pending?.rhTaskId;
+    if(!taskId) return;
+    const run = pending?.run || {};
+    const nodeId = run?.node?.id || '';
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : null;
+    try {
+        for(let i = 0; i < rhPollMax; i++){
+            await sleep(rhPollIntervalMs);
+            const data = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`).then(async r => {
+                const json = await r.json();
+                if(!r.ok || json.success === false) throw new Error(json.detail || json.error || tr('canvas.rhFailed'));
+                return json.data || json;
+            });
+            if(data.status === 'SUCCESS'){
+                const urls = data.urls || [];
+                if(!urls.length) throw new Error(tr('canvas.rhOutputsEmpty'));
+                if(out) out._pending = (out._pending || []).filter(p => p.id !== pending.id);
+                if(node){
+                    const compareRef = (run?.refs || [])[0];
+                    appendOutputImages(out, urls, compareRef, []);
+                    mergeGeneratedOutputs(node, urls, true);
+                    node.runStatus = 'done';
+                    node.runError = '';
+                    refreshRunNodes(node, out);
+                }
+                addGenerationLog({run, outputs:urls, runMs:nowMs() - Number(pending.startedAt || nowMs())});
+                scheduleSave();
+                return;
+            }
+            if(data.status === 'FAILED') throw new Error(data.failReason || tr('canvas.rhFailed'));
+        }
+        throw new Error(tr('canvas.rhTimeout'));
+    } catch(err){
+        if(out) out._pending = (out._pending || []).filter(p => p.id !== pending.id);
+        if(node){
+            node.runStatus = 'failed';
+            node.runError = err.message || String(err);
+            refreshRunNodes(node, out);
+        }
+        addGenerationLog({run, outputs:[], runMs:nowMs() - Number(pending.startedAt || nowMs()), error:err.message || String(err)});
+        scheduleSave();
+    }
 }
 function renderOutputMedia(item, useGridLayout=false){
     const url = outputUrlValue(item);
