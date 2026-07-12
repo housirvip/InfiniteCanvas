@@ -8976,8 +8976,14 @@ def runninghub_api_key(provider=None, use_wallet=False, prefer_wallet=False):
     return api_key
 
 def runninghub_app_headers(json_body=True, use_wallet=False):
-    headers = {"Host": "www.runninghub.cn"}
     provider = runninghub_provider()
+    base_url = str((provider or {}).get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL).strip()
+    host = ""
+    try:
+        host = urllib.parse.urlsplit(base_url).netloc
+    except Exception:
+        host = ""
+    headers = {"Host": host or "www.runninghub.cn"}
     if provider:
         free_key = os.getenv(provider_key_env(provider["id"]), "")
         wallet_key = os.getenv(runninghub_wallet_key_env(), "")
