@@ -11570,7 +11570,7 @@ async def runninghub_query(taskId: str = ""):
             status = "RUNNING"
         elif code in (813, "813"):
             status = "QUEUED"
-        elif code in (805, "805"):
+        elif code in (805, "805", 807, "807"):
             status = "FAILED"
         else:
             status = "UNKNOWN"
