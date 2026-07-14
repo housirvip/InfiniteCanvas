@@ -3296,7 +3296,7 @@ function openOutputNodeMenu(nodeId, clientX, clientY){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || node.type !== 'output') return;
     closeCreateMenu();
-    const imageCount = outputImageUrls(node).length;
+    const imageCount = outputConvertibleItems(node).length;
     const downloadableCount = outputDownloadableImageUrls(node).length;
     imageNodeMenu.classList.add('output-node-menu');
     imageNodeMenu.innerHTML = `
@@ -3377,6 +3377,16 @@ function closeImageNodeMenu(){
 function outputImageUrls(node){
     return (node?.images || []).filter(item => mediaKindForOutputItem(item) === 'image').map(outputUrlValue).filter(Boolean);
 }
+function outputConvertibleItems(node){
+    return (node?.images || []).map(item => {
+        const kind = mediaKindForOutputItem(item);
+        if(kind !== 'image' && kind !== 'video') return null;
+        const url = outputUrlValue(item);
+        if(!url || isMissingAssetUrl(url)) return null;
+        const name = (item && typeof item === 'object' && item.name) || outputImageName(url);
+        return {url, kind, name};
+    }).filter(Boolean);
+}
 function outputDownloadableImageUrls(node){
     return (node?.images || []).map(outputUrlValue).filter(url => url && !isMissingAssetUrl(url) && (url.startsWith('/output/') || url.startsWith('/assets/')));
 }
@@ -3402,14 +3412,14 @@ function downloadNameForGroupImage(item, index=0){
     return name;
 }
 function createInputGroupFromOutput(node, point){
-    const urls = outputImageUrls(node);
-    if(!node || !urls.length) return null;
-    const cols = Math.min(4, Math.max(1, Math.ceil(Math.sqrt(urls.length))));
+    const items = outputConvertibleItems(node);
+    if(!node || !items.length) return null;
+    const cols = Math.min(4, Math.max(1, Math.ceil(Math.sqrt(items.length))));
     const cardW = 260;
     const cardH = 336;
     const gap = 24;
     const base = point || {x:Number(node.x || 0), y:Number(node.y || 0)};
-    const imageNodes = urls.map((url, i) => {
+    const imageNodes = items.map((item, i) => {
         const col = i % cols;
         const row = Math.floor(i / cols);
         const img = {
@@ -3419,13 +3429,14 @@ function createInputGroupFromOutput(node, point){
             y:base.y + 58 + row * (cardH + gap),
             w:cardW,
             h:cardH,
-            url,
-            name:outputImageName(url)
+            url:item.url,
+            name:item.name,
+            mediaKind:item.kind
         };
         nodes.push(img);
         return img;
     });
-    const rows = Math.ceil(urls.length / cols);
+    const rows = Math.ceil(items.length / cols);
     const group = {
         id:uid('grp'),
         type:'group',
@@ -3441,7 +3452,7 @@ function createInputGroupFromOutput(node, point){
 function convertOutputNodeToInputGroup(nodeId){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || node.type !== 'output') return;
-    if(!outputImageUrls(node).length) return;
+    if(!outputConvertibleItems(node).length) return;
     pushUndo();
     const downstream = connections.filter(c => c.from === nodeId).map(c => c.to);
     const group = createInputGroupFromOutput(node, {x:Number(node.x || 0), y:Number(node.y || 0)});
@@ -3463,7 +3474,7 @@ function convertOutputNodeToInputGroup(nodeId){
 function copyOutputNodeToInputGroup(nodeId){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || node.type !== 'output') return;
-    if(!outputImageUrls(node).length) return;
+    if(!outputConvertibleItems(node).length) return;
     pushUndo();
     const group = createInputGroupFromOutput(node, {x:Number(node.x || 0) + 36, y:Number(node.y || 0) + 36});
     if(!group) return;
