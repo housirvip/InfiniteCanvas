@@ -2,6 +2,8 @@ const params = new URLSearchParams(location.search);
 const canvasId = params.get('id') || '';
 const sourceProjectId = params.get('project') || '';
 const CANVAS_LIST_PROJECT_KEY = 'canvasListCurrentProjectId';
+const PARALLEL_LIMIT_DEFAULT = 3;
+const PARALLEL_LIMIT_MAX = 20;
 const shell = document.getElementById('shell');
 const world = document.getElementById('world');
 const composer = document.getElementById('composer');
@@ -5909,7 +5911,7 @@ function createPromptNode(x, y, options={}){
 }
 function createLoopNode(x, y, options={}){
     if(!options.skipUndo) pushUndo();
-    const node = {id:uid('loop'), type:'smart-loop', x, y, w:340, h:168, title:'Loop', count:1, mode:'serial', showPrompt:false, imageInput:false, loopStart:1, imageBatchSize:1, variablePrompt:'', created_at:Date.now()};
+    const node = {id:uid('loop'), type:'smart-loop', x, y, w:340, h:168, title:'Loop', count:1, mode:'serial', showPrompt:false, imageInput:false, loopStart:1, imageBatchSize:1, parallelLimit:PARALLEL_LIMIT_DEFAULT, variablePrompt:'', created_at:Date.now()};
     nodes.push(node);
     if(options.select !== false) selectedId = node.id;
     render();
@@ -7059,6 +7061,7 @@ function smartLoopBodyHtml(node){
     node.mode = node.mode === 'parallel' ? 'parallel' : 'serial';
     node.loopStart = Math.max(1, Number(node.loopStart) || 1);
     node.imageBatchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
+    node.parallelLimit = Math.max(1, Math.min(PARALLEL_LIMIT_MAX, Number(node.parallelLimit) || PARALLEL_LIMIT_DEFAULT));
     node.showPrompt = Boolean(node.showPrompt);
     node.imageInput = Boolean(node.imageInput);
     const imageCount = smartLoopInputImages(node, {index:node.loopStart}).length;
@@ -7081,6 +7084,9 @@ function smartLoopBodyHtml(node){
                 <button type="button" class="loop-smart-control ${node.mode === 'parallel' ? 'active' : ''}" data-loop-mode="parallel" title="${escapeHtml(tr('smart.loopParallelTip'))}">${escapeHtml(tr('canvas.loopParallel'))}</button>
             </div>
         </div>
+        ${node.mode === 'parallel' ? `<div class="loop-smart-row loop-smart-mini">
+            ${loopNumberControlHtml({label:tr('canvas.loopParallelLimit'), value:node.parallelLimit, key:'parallelLimit', min:1, max:PARALLEL_LIMIT_MAX, quick:[1,2,3,4,5,6,8,10]})}
+        </div>` : ''}
         <div class="loop-smart-row">
             <button class="loop-smart-control loop-smart-toggle ${node.imageInput ? 'active' : ''}" type="button" data-loop-toggle="image"><i data-lucide="image"></i><span>${escapeHtml(tr('canvas.loopImageToggle'))}</span></button>
             <button class="loop-smart-control loop-smart-toggle ${node.showPrompt ? 'active' : ''}" type="button" data-loop-toggle="prompt"><i data-lucide="text-cursor-input"></i><span>${escapeHtml(tr('canvas.loopPromptToggle'))}</span></button>
@@ -7761,6 +7767,7 @@ function bindLoopNodeControls(el, node){
     const loopNumberBounds = key => {
         if(key === 'loopStart') return {min:1, max:9999};
         if(key === 'imageBatchSize') return {min:1, max:100};
+        if(key === 'parallelLimit') return {min:1, max:PARALLEL_LIMIT_MAX};
         return {min:1, max:100};
     };
     const normalizeLoopNumber = (key, rawValue) => {
@@ -7781,6 +7788,7 @@ function bindLoopNodeControls(el, node){
         if(key === 'count') node.count = smartLoopCount({count:value});
         if(key === 'loopStart') node.loopStart = value;
         if(key === 'imageBatchSize') node.imageBatchSize = value;
+        if(key === 'parallelLimit') node.parallelLimit = value;
         scheduleSave();
         if(rerender) render();
         else syncLoopNumberUi(source, key, value);
@@ -7807,6 +7815,7 @@ function bindLoopNodeControls(el, node){
             e.preventDefault();
             e.stopPropagation();
             node.mode = btn.dataset.loopMode === 'parallel' ? 'parallel' : 'serial';
+            if(node.mode === 'parallel' && node.parallelLimit == null) node.parallelLimit = PARALLEL_LIMIT_DEFAULT;
             render();
             scheduleSave();
         };
@@ -14125,9 +14134,11 @@ function requestSmartCascadeStop(loopId=''){
     toast('已请求停止，当前任务完成后停止');
     render();
 }
-function smartCascadeParallelLimit(chain=[]){
+function smartCascadeParallelLimit(chain=[], loopNode=null){
+    const userLimit = Math.max(1, Math.min(PARALLEL_LIMIT_MAX, Number(loopNode?.parallelLimit) || PARALLEL_LIMIT_DEFAULT));
     const hasComfy = (chain || []).some(node => smartSettingsForNode(node)?.engine === 'comfy');
-    return hasComfy ? Math.max(1, Math.min(6, Number(comfyInstanceCount) || 1)) : 6;
+    const systemCap = hasComfy ? Math.max(1, Math.min(PARALLEL_LIMIT_MAX, Number(comfyInstanceCount) || 1)) : PARALLEL_LIMIT_MAX;
+    return Math.min(userLimit, systemCap);
 }
 async function runSmartCascadeRoundsWithLimit(roundIndexes, limit, runner, runState=null){
     let next = 0;
@@ -14176,7 +14187,7 @@ async function runSmartCascade(targetNode=null){
     const batchSize = loop?.node?.imageInput ? Math.max(1, Math.min(100, Number(loop.node.imageBatchSize) || 1)) : 1;
     const endIndex = startIndex + (totalRounds - 1) * batchSize;
     const loopMode = loop?.mode === 'parallel' ? 'parallel' : 'serial';
-    const parallelLimit = loopMode === 'parallel' && totalRounds > 1 ? smartCascadeParallelLimit(chain) : 1;
+    const parallelLimit = loopMode === 'parallel' && totalRounds > 1 ? smartCascadeParallelLimit(chain, loop?.node) : 1;
     const precreateSingleSlots = singleNodeLoopRun && loopMode === 'parallel' && totalRounds > 1 && parallelLimit > 1;
     let singleLoopSlots = [];
     if(singleNodeLoopRun){

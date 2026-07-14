@@ -7,6 +7,8 @@ function trf(key, values={}){
 function langIsEn(){ return window.StudioI18n?.lang?.() === 'en'; }
 const CANVAS_UPLOAD_MAX = 20;
 const CANVAS_REFERENCE_IMAGE_MAX = 20;
+const PARALLEL_LIMIT_DEFAULT = 3;
+const PARALLEL_LIMIT_MAX = 20;
 function actionFailed(labelKey, detail=''){
     const label = tr(labelKey);
     return langIsEn() ? `${label} failed${detail ? `: ${detail}` : ''}` : `${label}失败${detail ? `：${detail}` : ''}`;
@@ -2476,7 +2478,8 @@ function addLoopNode(point){
         imageBatchSize:1,
         videoBatchSize:1,
         variablePrompt:'',
-        fixedPrompt:''
+        fixedPrompt:'',
+        parallelLimit:PARALLEL_LIMIT_DEFAULT
     });
 }
 function addGroupNode(point){
@@ -7715,6 +7718,7 @@ function renderLoopBody(node){
     node.loopStart = Math.max(1, Number(node.loopStart) || 1);
     node.imageBatchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
     node.mode = node.mode === 'parallel' ? 'parallel' : 'serial';
+    node.parallelLimit = Math.max(1, Math.min(PARALLEL_LIMIT_MAX, Number(node.parallelLimit) || PARALLEL_LIMIT_DEFAULT));
     node.showPrompt = Boolean(node.showPrompt);
     node.imageInput = Boolean(node.imageInput);
     node.videoInput = false;
@@ -7739,6 +7743,10 @@ function renderLoopBody(node){
                     <button type="button" data-loop-mode="parallel" class="${node.mode === 'parallel' ? 'active' : ''}">${tr('canvas.loopParallel')}</button>
                 </div>
             </div>
+            ${node.mode === 'parallel' ? `<div class="loop-parallel-limit" style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+                <span class="loop-count-label">${tr('canvas.loopParallelLimit')}</span>
+                <input class="loop-count-input loop-parallel-input" type="number" min="1" max="${PARALLEL_LIMIT_MAX}" step="1" value="${node.parallelLimit}">
+            </div>` : ''}
             <div class="loop-toggle-row">
                 <button class="loop-toggle loop-image-toggle ${node.imageInput ? 'active' : ''}" type="button"><i data-lucide="image" class="w-3.5 h-3.5"></i>${tr('canvas.loopImageToggle')}</button>
                 <button class="loop-toggle loop-prompt-toggle ${node.showPrompt ? 'active' : ''}" type="button"><i data-lucide="text-cursor-input" class="w-3.5 h-3.5"></i>${tr('canvas.loopPromptToggle')}</button>
@@ -7853,10 +7861,21 @@ function renderLoopBody(node){
             refreshGeneratorInputViews();
         };
     }
+    const parallelInput = wrap.querySelector('.loop-parallel-input');
+    if(parallelInput){
+        parallelInput.onmousedown = e => e.stopPropagation();
+        parallelInput.onclick = e => e.stopPropagation();
+        parallelInput.onchange = e => {
+            node.parallelLimit = Math.max(1, Math.min(PARALLEL_LIMIT_MAX, Number(e.target.value) || PARALLEL_LIMIT_DEFAULT));
+            e.target.value = node.parallelLimit;
+            scheduleSave();
+        };
+    }
     wrap.querySelectorAll('[data-loop-mode]').forEach(btn => {
         btn.onclick = e => {
             e.stopPropagation();
             node.mode = btn.dataset.loopMode === 'parallel' ? 'parallel' : 'serial';
+            if(node.mode === 'parallel' && node.parallelLimit == null) node.parallelLimit = PARALLEL_LIMIT_DEFAULT;
             render();
             scheduleSave();
         };
@@ -11647,10 +11666,11 @@ async function runCascadeNodeWithLoopContext(node, ctx, opts={}){
         }
     }
 }
-function cascadeParallelLimit(order, totalRounds){
+function cascadeParallelLimit(order, totalRounds, loopNode=null){
+    const userLimit = Math.max(1, Math.min(PARALLEL_LIMIT_MAX, Number(loopNode?.parallelLimit) || PARALLEL_LIMIT_DEFAULT));
     const hasComfy = order.some(id => nodes.find(n => n.id === id)?.type === 'comfy');
-    if(hasComfy) return Math.max(1, Math.min(totalRounds, comfyBackendCount || 1));
-    return Math.max(1, Math.min(totalRounds, 6));
+    const systemCap = hasComfy ? Math.max(1, Math.min(totalRounds, comfyBackendCount || 1)) : PARALLEL_LIMIT_MAX;
+    return Math.max(1, Math.min(totalRounds, Math.min(userLimit, systemCap)));
 }
 async function runLimitedCascadeRounds(rounds, limit, runner){
     let next = 0;
@@ -11796,7 +11816,7 @@ async function runNodeCascade(nodeId){
         refreshNodes(cascadeUiNodeIds(nodeId, order));
         let done = 0;
         const rounds = Array.from({length:totalRounds}, (_, idx) => ({idx, index:startIdx + idx * loopBatchSize}));
-        const limit = cascadeParallelLimit(order, totalRounds);
+        const limit = cascadeParallelLimit(order, totalRounds, loop?.node);
         const results = await runLimitedCascadeRounds(rounds, limit, async ({index}) => {
             ensureCascadeActive(nodeId, ctx.message);
             const loopCtx = {index, total:endIdx, nodeId:loop.node.id};

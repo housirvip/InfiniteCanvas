@@ -35,6 +35,7 @@
         "canvas.loopStart": { zh: "起始", en: "Start" },
         "canvas.loopSerial": { zh: "循环", en: "Batch" },
         "canvas.loopParallel": { zh: "并发", en: "Concurrent" },
+        "canvas.loopParallelLimit": { zh: "并发数", en: "Concurrency" },
         "canvas.loopHint": { zh: "控制一键运行轮数", en: "Controls cascade rounds" },
         "canvas.loopPromptToggle": { zh: "提示词", en: "Prompt" },
         "canvas.loopImageToggle": { zh: "图片", en: "Images" },
